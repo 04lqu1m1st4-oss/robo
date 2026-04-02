@@ -93,21 +93,22 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  private clients = new Map<string, TelegramClient>();
+  // Guarda o client + a session string usada para criá-lo
+  // (o gramJS muta a StringSession internamente após connect, então não dá
+  //  pra comparar session.save() com o banco — usamos a string original)
+  private clients = new Map<string, { client: TelegramClient; sessionString: string }>();
 
   async get(account: Account): Promise<TelegramClient> {
-    const existing = this.clients.get(account.id);
-    if (existing) {
+    const entry = this.clients.get(account.id);
+    if (entry) {
       try {
-        if (existing.connected) {
-          // Verifica se a session em memória ainda bate com o banco
-          const cachedSession = (existing.session as StringSession).save();
-          if (cachedSession === account.session_string) {
-            return existing;
+        if (entry.client.connected) {
+          if (entry.sessionString === account.session_string) {
+            return entry.client; // mesmo client, mesma session — reutiliza
           }
           // Session foi trocada no banco (conta re-autenticada) — descarta
           console.log(`[pool] Session atualizada para ${account.phone_number} — reconectando`);
-          try { await existing.disconnect(); } catch {}
+          try { await entry.client.disconnect(); } catch {}
           this.clients.delete(account.id);
         }
       } catch {
@@ -123,15 +124,15 @@ class TelegramClientPool {
       { connectionRetries: 3 }
     );
     await client.connect();
-    this.clients.set(account.id, client);
+    this.clients.set(account.id, { client, sessionString: account.session_string });
     console.log(`[pool] Conectado: ${account.phone_number}`);
     return client;
   }
 
   invalidate(accountId: string): void {
-    const client = this.clients.get(accountId);
-    if (client) {
-      try { client.disconnect(); } catch {}
+    const entry = this.clients.get(accountId);
+    if (entry) {
+      try { entry.client.disconnect(); } catch {}
       this.clients.delete(accountId);
       console.log(`[pool] Client invalidado: ${accountId}`);
     }
@@ -145,8 +146,8 @@ class TelegramClientPool {
 
   async disconnectAll(): Promise<void> {
     await Promise.all(
-      [...this.clients.entries()].map(async ([id, client]) => {
-        try { await client.disconnect(); } catch {}
+      [...this.clients.entries()].map(async ([id, entry]) => {
+        try { await entry.client.disconnect(); } catch {}
         console.log(`[pool] Desconectado: ${id}`);
       })
     );
