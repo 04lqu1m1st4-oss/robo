@@ -633,10 +633,10 @@ async function init(): Promise<void> {
     reloadSchedules(),
   ]);
 
-  // Reload periódico para pegar novos schedules
+  // Reload periódico — pega novos schedules E contas recém-autenticadas no Vercel
   setInterval(async () => {
     try {
-      await reloadSchedules();
+      await Promise.all([reloadSchedules(), prewarmAccounts()]);
     } catch (err) {
       console.error("[reload] Erro no reload periódico:", err);
     }
