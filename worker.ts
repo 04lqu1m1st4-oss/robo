@@ -93,13 +93,25 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  private clients = new Map<string, TelegramClient>();
+  private clients  = new Map<string, TelegramClient>();
+  private sessions = new Map<string, string>(); // account_id → session_string em uso
 
   async get(account: Account): Promise<TelegramClient> {
-    const existing = this.clients.get(account.id);
-    if (existing?.connected) return existing;
+    const existing       = this.clients.get(account.id);
+    const sessionInUse   = this.sessions.get(account.id);
+    const sessionChanged = sessionInUse !== account.session_string;
 
-    if (existing) this.clients.delete(account.id);
+    // Reconecta se: não existe, desconectou, ou session_string mudou no banco
+    if (existing?.connected && !sessionChanged) return existing;
+
+    if (existing) {
+      try { await existing.disconnect(); } catch {}
+      this.clients.delete(account.id);
+    }
+
+    if (sessionChanged && sessionInUse) {
+      console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
+    }
 
     const client = new TelegramClient(
       new StringSession(account.session_string),
@@ -109,6 +121,7 @@ class TelegramClientPool {
     );
     await client.connect();
     this.clients.set(account.id, client);
+    this.sessions.set(account.id, account.session_string);
     console.log(`[pool] Conectado: ${account.phone_number}`);
     return client;
   }
