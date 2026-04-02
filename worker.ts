@@ -1,12 +1,11 @@
 // worker.ts
 //
-// Processo Node.js persistente rodando no Fly.io (região: ams).
+// Processo Node.js persistente rodando no Railway.
 // Substitui o Vercel Cron + process-schedules/route.ts.
 //
 // Vantagens sobre Vercel serverless:
 //   - Sem cold start: processo fica rodando 24/7
 //   - Conexões Telegram aquecidas e mantidas entre ciclos
-//   - RTT mínimo: região ams é co-located com os servidores do Telegram
 //   - Cron via node-cron com precisão de segundos (não minutos fixos)
 //
 // Lógica de retry mantida igual ao original:
@@ -27,7 +26,7 @@ const supabase = createClient(
 );
 
 /* ─── Budgets e timeouts ─── */
-const INLINE_RETRY_BUDGET_MS = 50_000; // sem limite de 60s do Vercel — margem generosa
+const INLINE_RETRY_BUDGET_MS = 50_000;
 const SEND_TIMEOUT_MS        = 20_000;
 
 /* ─── Tipos ─── */
@@ -78,7 +77,7 @@ interface MemberResult {
 }
 
 /* ─── Pool de conexões Telegram persistente ──────────────────────────────
-   Diferença chave vs Vercel: o pool vive enquanto o processo viver.
+   O pool vive enquanto o processo viver.
    Conexões abertas num ciclo ficam disponíveis no próximo — zero connect()
    em ciclos subsequentes para o mesmo account_id.                      ─── */
 class TelegramClientPool {
@@ -87,11 +86,9 @@ class TelegramClientPool {
   async get(account: Account): Promise<TelegramClient> {
     const existing = this.clients.get(account.id);
     if (existing) {
-      // Verifica se a conexão ainda está viva
       try {
         if (existing.connected) return existing;
       } catch {
-        // conexão morta — remove e reconecta
         this.clients.delete(account.id);
       }
     }
@@ -317,7 +314,7 @@ async function processMembersOf(
     }
   }
 
-  let pending      = [...toProcess];
+  let pending       = [...toProcess];
   let inlineAttempt = 0;
 
   while (pending.length > 0) {
@@ -414,7 +411,6 @@ async function runCycle() {
   if (normalError) { console.error("[worker] Erro ao buscar schedules:", normalError); return; }
   if (retryError)  { console.error("[worker] Erro ao buscar retries:", retryError); return; }
 
-  // Retries expirados
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[worker] Schedule ${expired.id}: retry expirou. Avançando.`);
@@ -439,7 +435,7 @@ async function runCycle() {
     ...(retrySchedules ?? []).filter((s) => isRetryDue(s as unknown as Schedule, now)),
   ] as unknown as Schedule[];
 
-  if (allSchedules.length === 0) return; // nada a fazer neste tick
+  if (allSchedules.length === 0) return;
 
   console.log(
     `[worker] Processando ${allSchedules.length} schedule(s) ` +
@@ -507,16 +503,48 @@ async function runCycle() {
   }
 }
 
-// ─── Inicia o cron — roda a cada 30 segundos ────────────────────────────
-// node-cron suporta granularidade de segundos com 6 campos.
-// Expressão "*/30 * * * * *" = a cada 30 segundos → garante que nenhum
-// schedule espera mais de 30s além do horário exato.
-console.log("[worker] Iniciando — região ams — pool Telegram persistente");
+/* ─── Pré-aquece conexões Telegram no startup ────────────────────────────
+   Conecta todas as contas ativas antes do cron começar.
+   Quando o primeiro disparo chegar, o pool já está quente — zero latência
+   de TCP handshake + MTProto layer negotiation na hora do envio.       ─── */
+async function warmupConnections() {
+  console.log("[worker] Aquecendo conexões Telegram...");
 
-cron.schedule("*/30 * * * * *", async () => {
-  try {
-    await runCycle();
-  } catch (err) {
-    console.error("[worker] Erro inesperado no ciclo:", err);
+  const { data: accounts, error } = await supabase
+    .from("accounts")
+    .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+    .eq("is_active", true);
+
+  if (error || !accounts?.length) {
+    console.warn("[worker] Nenhuma conta ativa para aquecer:", error?.message ?? "lista vazia");
+    return;
   }
+
+  await Promise.allSettled(
+    accounts.map(async (account) => {
+      try {
+        await clientPool.get(account as Account);
+        console.log(`[pool] ✓ Aquecido: ${account.phone_number}`);
+      } catch (err) {
+        console.warn(`[pool] ✗ Falha ao aquecer ${account.phone_number}:`, err);
+      }
+    })
+  );
+
+  console.log(`[worker] Warmup concluído — ${accounts.length} conta(s) prontas`);
+}
+
+/* ─── Inicia o worker ───────────────────────────────────────────────────
+   1. Aquece todas as conexões Telegram
+   2. Só então inicia o cron a cada 30 segundos                         ─── */
+console.log("[worker] Iniciando — pool Telegram persistente");
+
+warmupConnections().then(() => {
+  cron.schedule("*/30 * * * * *", async () => {
+    try {
+      await runCycle();
+    } catch (err) {
+      console.error("[worker] Erro inesperado no ciclo:", err);
+    }
+  });
 });
