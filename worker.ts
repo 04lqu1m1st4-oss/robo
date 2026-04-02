@@ -637,7 +637,10 @@ async function reloadSchedules(): Promise<void> {
 }
 
 /* ─── Pre-warm: busca contas do banco, atualiza cache e conecta no pool ─── */
+let prewarmRunning = false;
 async function prewarmAccounts(): Promise<void> {
+  if (prewarmRunning) return;
+  prewarmRunning = true;
   const { data, error } = await supabase
     .from("accounts")
     .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
@@ -656,6 +659,7 @@ async function prewarmAccounts(): Promise<void> {
   }
 
   await clientPool.prewarm(accounts);
+  prewarmRunning = false;
 }
 
 /* ─── Inicialização ─── */
