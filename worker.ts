@@ -19,7 +19,7 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const SEND_TIMEOUT_MS        = 15_000;
+const SEND_TIMEOUT_MS       = 15_000;
 const INLINE_RETRY_BUDGET_MS = 50_000;
 
 // Fast retry (grupo fechado): 100ms, 200ms, 300ms... cap em 5s
@@ -93,29 +93,13 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  // Guarda o client + a session string usada para criá-lo
-  // (o gramJS muta a StringSession internamente após connect, então não dá
-  //  pra comparar session.save() com o banco — usamos a string original)
-  private clients = new Map<string, { client: TelegramClient; sessionString: string }>();
+  private clients = new Map<string, TelegramClient>();
 
   async get(account: Account): Promise<TelegramClient> {
-    const entry = this.clients.get(account.id);
-    if (entry) {
-      try {
-        if (entry.client.connected) {
-          if (entry.sessionString === account.session_string) {
-            return entry.client; // mesmo client, mesma session — reutiliza
-          }
-          // Session foi trocada no banco (conta re-autenticada) — descarta
-          console.log(`[pool] Session atualizada para ${account.phone_number} — reconectando`);
-          try { await entry.client.disconnect(); } catch {}
-          this.clients.delete(account.id);
-        }
-      } catch {
-        // conexão morta — remove e reconecta
-        this.clients.delete(account.id);
-      }
-    }
+    const existing = this.clients.get(account.id);
+    if (existing?.connected) return existing;
+
+    if (existing) this.clients.delete(account.id);
 
     const client = new TelegramClient(
       new StringSession(account.session_string),
@@ -124,18 +108,9 @@ class TelegramClientPool {
       { connectionRetries: 3 }
     );
     await client.connect();
-    this.clients.set(account.id, { client, sessionString: account.session_string });
+    this.clients.set(account.id, client);
     console.log(`[pool] Conectado: ${account.phone_number}`);
     return client;
-  }
-
-  invalidate(accountId: string): void {
-    const entry = this.clients.get(accountId);
-    if (entry) {
-      try { entry.client.disconnect(); } catch {}
-      this.clients.delete(accountId);
-      console.log(`[pool] Client invalidado: ${accountId}`);
-    }
   }
 
   async prewarm(accounts: Account[]): Promise<void> {
@@ -146,8 +121,8 @@ class TelegramClientPool {
 
   async disconnectAll(): Promise<void> {
     await Promise.all(
-      [...this.clients.entries()].map(async ([id, entry]) => {
-        try { await entry.client.disconnect(); } catch {}
+      [...this.clients.entries()].map(async ([id, client]) => {
+        try { await client.disconnect(); } catch {}
         console.log(`[pool] Desconectado: ${id}`);
       })
     );
@@ -251,12 +226,17 @@ async function sendWithFastRetry(
     );
 
     const trySend = (async () => {
-      // Peer cacheado — sem roundtrip de rede após a primeira resolução
+      // Se PEER_ID_INVALID, limpa o cache e resolve de novo na próxima tentativa
       const peer = await getOrResolvePeer(client, telegramChatId);
 
       try {
         await client.sendMessage(peer as any, { message: messageText });
       } catch (err: any) {
+        if (String(err?.message ?? "").includes("PEER_ID_INVALID")) {
+          console.warn(`[peer] Cache inválido para ${telegramChatId} — limpando e resolvendo novamente`);
+          peerCache.delete(telegramChatId);
+        }
+        // FloodWait
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -285,20 +265,15 @@ async function sendWithFastRetry(
       }
       return; // sucesso
     } catch (err: unknown) {
-      // Erros de auth não adianta retentar — propaga imediatamente
-      const errMsg = (err as any)?.message ?? String(err);
-      if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|AUTH_KEY_INVALID/i.test(errMsg)) {
-        throw err;
-      }
-
       if (Date.now() < windowEnd) {
-        const waitMs   = Math.min(FAST_RETRY_BASE_MS * (attempt + 1), FAST_RETRY_CAP_MS);
+        // Fast retry linear em qualquer erro: 100ms, 200ms, 300ms...
+        const waitMs  = Math.min(FAST_RETRY_BASE_MS * (attempt + 1), FAST_RETRY_CAP_MS);
         const timeLeft = windowEnd - Date.now();
 
         if (timeLeft > waitMs) {
           console.log(
             `[fast-retry] Falha na tentativa ${attempt + 1} — aguardando ${waitMs}ms ` +
-            `(${Math.round(timeLeft / 1000)}s restantes): ${errMsg}`
+            `(${Math.round(timeLeft / 1000)}s restantes): ${(err as any)?.message ?? err}`
           );
           await new Promise((r) => setTimeout(r, waitMs));
           attempt++;
@@ -328,16 +303,8 @@ async function trySendMember(
     logStatus = "sent";
     console.log(`[worker] ✓ ${member.id} (${account.phone_number})`);
   } catch (err) {
-    errorMsg = err instanceof Error ? err.message : String(err);
-    // Erros de auth: invalida o client do pool e não retenta (sessão morta)
-    const isAuthError = /AUTH_KEY_UNREGISTERED|SESSION_REVOKED|AUTH_KEY_INVALID/i.test(errorMsg);
-    if (isAuthError) {
-      console.warn(`[pool] Auth error em ${account.phone_number} — invalidando client do pool`);
-      clientPool.invalidate(account.id);
-      retryable = false;
-    } else {
-      retryable = isRetryableError(errorMsg);
-    }
+    errorMsg  = err instanceof Error ? err.message : String(err);
+    retryable = isRetryableError(errorMsg);
     console.error(
       `[worker] ✗ ${member.id} [${retryable ? "retryável" : "permanente"}] ` +
       `(${account.phone_number}): ${errorMsg}`
@@ -434,6 +401,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const now    = new Date();
   const nowISO = now.toISOString();
 
+  // Re-busca o schedule no momento do disparo — confirma que ainda é válido
   const { data: rows, error } = await supabase
     .from("schedules")
     .select(`
@@ -490,6 +458,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }).eq("id", scheduleId);
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
+
+    // Agenda o próximo disparo automaticamente
     scheduleTimer(scheduleId, nextRun);
 
   } else {
@@ -526,11 +496,18 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 /* ─── Mapa de timers ativos ─── */
 const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/* ─── Agenda um precision timer para um schedule ─────────────────────────
+   Cancela qualquer timer anterior para o mesmo schedule_id antes de criar
+   um novo (evita duplicatas se o reload encontrar o mesmo schedule).    ─── */
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
-  if (delay < -5000) return; // já passou há mais de 5s
+  if (delay < -5000) {
+    // já passou há mais de 5s — não agenda (o reload de retry vai pegar)
+    return;
+  }
 
+  // Cancela timer anterior se existir
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
 
@@ -551,10 +528,13 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   console.log(`[timer] ⏰ Schedule ${scheduleId} agendado — dispara em ${Math.round(effectiveDelay / 1000)}s (${fireAt})`);
 }
 
-/* ─── Reload periódico ─── */
+/* ─── Reload periódico ────────────────────────────────────────────────────
+   A cada 30s: busca schedules futuros no lookahead e schedules em retry.
+   Garante que novos schedules criados enquanto o worker roda sejam agendados.
+   Também garante que retries cross-invocation sejam disparados a tempo.  ─── */
 async function reloadSchedules(): Promise<void> {
-  const now          = new Date();
-  const nowISO       = now.toISOString();
+  const now        = new Date();
+  const nowISO     = now.toISOString();
   const lookaheadISO = new Date(now.getTime() + LOOKAHEAD_MS).toISOString();
 
   const [
@@ -562,6 +542,7 @@ async function reloadSchedules(): Promise<void> {
     { data: retrySchedules  },
     { data: expiredRetries  },
   ] = await Promise.all([
+    // Schedules normais dentro da janela de lookahead
     supabase
       .from("schedules")
       .select("id, next_run_at")
@@ -569,6 +550,7 @@ async function reloadSchedules(): Promise<void> {
       .is("retry_until", null)
       .lte("next_run_at", lookaheadISO),
 
+    // Schedules em retry cross-invocation ainda dentro da janela
     supabase
       .from("schedules")
       .select(`
@@ -583,6 +565,7 @@ async function reloadSchedules(): Promise<void> {
       .not("retry_until", "is", null)
       .gt("retry_until", nowISO),
 
+    // Retries expirados
     supabase
       .from("schedules")
       .select("id, cron_expression")
@@ -591,6 +574,7 @@ async function reloadSchedules(): Promise<void> {
       .lte("retry_until", nowISO),
   ]);
 
+  // Limpa retries expirados
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando.`);
@@ -611,10 +595,12 @@ async function reloadSchedules(): Promise<void> {
     })
   );
 
+  // Agenda timers para schedules futuros
   for (const s of futureSchedules ?? []) {
     scheduleTimer(s.id, s.next_run_at);
   }
 
+  // Dispara retries cross-invocation que já são devidos
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
     if (isRetryDue(schedule, now) && !scheduledTimers.has(schedule.id)) {
@@ -626,7 +612,7 @@ async function reloadSchedules(): Promise<void> {
   }
 }
 
-/* ─── Pre-warm ─── */
+/* ─── Pre-warm: conecta todas as contas ativas antes do primeiro disparo ─── */
 async function prewarmAccounts(): Promise<void> {
   const { data, error } = await supabase
     .from("accounts")
@@ -645,8 +631,13 @@ async function prewarmAccounts(): Promise<void> {
 async function init(): Promise<void> {
   console.log("[worker] Iniciando — precision timers + peer cache + fast retry");
 
-  await Promise.all([prewarmAccounts(), reloadSchedules()]);
+  // Pre-warm de conexões em paralelo com o primeiro reload
+  await Promise.all([
+    prewarmAccounts(),
+    reloadSchedules(),
+  ]);
 
+  // Reload periódico — pega novos schedules E contas recém-autenticadas no Vercel
   setInterval(async () => {
     try {
       await Promise.all([reloadSchedules(), prewarmAccounts()]);
