@@ -507,10 +507,10 @@ async function runCycle() {
   }
 }
 
-/* ─── Inicia o cron — roda todo minuto, nos segundos 0 e 30 ─────────────
-   node-cron suporta granularidade de segundos com 6 campos.
-   "*/30 * * * * *" = a cada 30 segundos → garante que nenhum schedule
-   espera mais de 30s além do horário exato.                           ─── */
+// ─── Inicia o cron — roda a cada 30 segundos ────────────────────────────
+// node-cron suporta granularidade de segundos com 6 campos.
+// Expressão "*/30 * * * * *" = a cada 30 segundos → garante que nenhum
+// schedule espera mais de 30s além do horário exato.
 console.log("[worker] Iniciando — região ams — pool Telegram persistente");
 
 cron.schedule("*/30 * * * * *", async () => {
