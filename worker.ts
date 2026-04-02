@@ -91,19 +91,6 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
   return peer;
 }
 
-/* ─── Detecta erro de grupo fechado (ChatWriteForbidden, SlowMode, etc.) ─── */
-function isGroupClosedError(err: unknown): boolean {
-  const msg = String((err as any)?.message ?? (err as any)?.constructor?.name ?? err).toUpperCase();
-  return (
-    msg.includes("CHAT_WRITE_FORBIDDEN")       ||
-    msg.includes("CHAT_SEND_PLAIN_FORBIDDEN")  ||
-    msg.includes("CHAT_SEND_MEDIA_FORBIDDEN")  ||
-    msg.includes("USER_BANNED_IN_CHANNEL")     ||
-    msg.includes("SLOWMODE_WAIT")              ||
-    msg.includes("RIGHT")                      // ChatAdminRequiredError etc.
-  );
-}
-
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
   private clients = new Map<string, TelegramClient>();
@@ -274,17 +261,15 @@ async function sendWithFastRetry(
       }
       return; // sucesso
     } catch (err: unknown) {
-      const isClosedGroup = isGroupClosedError(err);
-
-      if (isClosedGroup && Date.now() < windowEnd) {
-        // Fast retry linear: 100ms, 200ms, 300ms...
-        const waitMs = Math.min(FAST_RETRY_BASE_MS * (attempt + 1), FAST_RETRY_CAP_MS);
+      if (Date.now() < windowEnd) {
+        // Fast retry linear em qualquer erro: 100ms, 200ms, 300ms...
+        const waitMs  = Math.min(FAST_RETRY_BASE_MS * (attempt + 1), FAST_RETRY_CAP_MS);
         const timeLeft = windowEnd - Date.now();
 
         if (timeLeft > waitMs) {
           console.log(
-            `[fast-retry] Grupo fechado — tentativa ${attempt + 1}, ` +
-            `aguardando ${waitMs}ms (${Math.round(timeLeft / 1000)}s restantes)`
+            `[fast-retry] Falha na tentativa ${attempt + 1} — aguardando ${waitMs}ms ` +
+            `(${Math.round(timeLeft / 1000)}s restantes): ${(err as any)?.message ?? err}`
           );
           await new Promise((r) => setTimeout(r, waitMs));
           attempt++;
@@ -292,7 +277,7 @@ async function sendWithFastRetry(
         }
       }
 
-      throw err; // não é grupo fechado, ou janela esgotou
+      throw err; // janela esgotou
     }
   }
 }
