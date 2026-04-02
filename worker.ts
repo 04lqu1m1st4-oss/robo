@@ -80,7 +80,8 @@ interface MemberResult {
 /* ─── Peer cache global ──────────────────────────────────────────────────
    getInputEntity faz um roundtrip de rede (~100-200ms). Cacheado uma vez,
    reutilizado para sempre enquanto o processo viver.                    ─── */
-const peerCache = new Map<string, unknown>();
+const peerCache    = new Map<string, unknown>();
+const accountCache = new Map<string, Account>(); // account_id → dados mais recentes do banco
 
 async function getOrResolvePeer(client: TelegramClient, telegramChatId: string): Promise<unknown> {
   if (peerCache.has(telegramChatId)) return peerCache.get(telegramChatId)!;
@@ -442,6 +443,16 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
+  // Substitui accounts dos members pela versão em cache (session_string mais recente, sem query extra)
+  if (group.group_members) {
+    group.group_members = group.group_members.map((m) => ({
+      ...m,
+      accounts: m.accounts
+        ? (accountCache.get(m.accounts.id) ?? m.accounts)
+        : null,
+    }));
+  }
+
   console.log(`[timer] ⚡ Disparando schedule ${scheduleId} às ${nowISO}`);
 
   const succeededIds = await getSucceededAccountIds(schedule);
@@ -625,7 +636,7 @@ async function reloadSchedules(): Promise<void> {
   }
 }
 
-/* ─── Pre-warm: conecta todas as contas ativas antes do primeiro disparo ─── */
+/* ─── Pre-warm: busca contas do banco, atualiza cache e conecta no pool ─── */
 async function prewarmAccounts(): Promise<void> {
   const { data, error } = await supabase
     .from("accounts")
@@ -637,7 +648,14 @@ async function prewarmAccounts(): Promise<void> {
     return;
   }
 
-  await clientPool.prewarm((data ?? []) as Account[]);
+  const accounts = (data ?? []) as Account[];
+
+  // Atualiza cache em memória — na hora H o fireSchedule usa daqui, sem query
+  for (const account of accounts) {
+    accountCache.set(account.id, account);
+  }
+
+  await clientPool.prewarm(accounts);
 }
 
 /* ─── Inicialização ─── */
