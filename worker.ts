@@ -233,6 +233,8 @@ async function sendWithFastRetry(
 ): Promise<void> {
   const windowEnd = Date.now() + FAST_RETRY_WINDOW_MS;
   let attempt     = 0;
+  let zigzagDir   = 1;  // 1 = subindo, -1 = descendo
+  let zigzagStep  = 1;  // step atual em unidades de 100ms (1=100ms, 7=700ms)
 
   while (true) {
     const timeout = new Promise<never>((_, r) =>
@@ -281,7 +283,7 @@ async function sendWithFastRetry(
     } catch (err: unknown) {
       if (Date.now() < windowEnd) {
         // Fast retry linear em qualquer erro: 100ms, 200ms, 300ms...
-        const waitMs  = Math.min(FAST_RETRY_BASE_MS * (attempt + 1), FAST_RETRY_CAP_MS);
+        const waitMs  = zigzagStep * FAST_RETRY_BASE_MS;
         const timeLeft = windowEnd - Date.now();
 
         if (timeLeft > waitMs) {
@@ -291,6 +293,12 @@ async function sendWithFastRetry(
           );
           await new Promise((r) => setTimeout(r, waitMs));
           attempt++;
+
+          // Zig-zag: sobe de 100ms em 100ms até 700ms, depois desce até 100ms, oscila
+          zigzagStep += zigzagDir;
+          if (zigzagStep >= 7) zigzagDir = -1;
+          if (zigzagStep <= 1) zigzagDir =  1;
+
           continue;
         }
       }
