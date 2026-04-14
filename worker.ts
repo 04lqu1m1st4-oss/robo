@@ -6,6 +6,8 @@
 //   3. [Fix Bug 3] Envio sequencial (for await) — sem double-send paralelo.
 //   4. [Fix Bug 4] AUTH_KEY_DUPLICATED: connection coalescing + prewarm não reconecta conta já conectada.
 //   5. [Fix Bug 5] Janela de 1 minuto — se chegou atrasado > 60s, descarta e avança para próxima semana.
+//   6. [Fix Bug 6] gramjs auto-reconnect: pool detecta cliente em reconexão via _sender._isConnected
+//                  e aguarda ou reevicta em vez de usar referência em estado de flux.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -18,7 +20,7 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const FIRE_WINDOW_MS         = 60_000;  // FIX BUG 5: descarta se atrasado mais de 1 minuto
+const FIRE_WINDOW_MS         = 60_000;  // descarta se atrasado mais de 1 minuto
 const SEND_TIMEOUT_MS        = 15_000;
 const INLINE_RETRY_BUDGET_MS = 50_000;
 
@@ -27,6 +29,10 @@ const FAST_RETRY_WINDOW_MS = 30_000;
 
 const RELOAD_INTERVAL_MS = 30_000;
 const LOOKAHEAD_MS       = 2 * 60 * 1000; // 2 minutos
+
+// Tempo máximo para aguardar gramjs terminar seu próprio reconnect antes de
+// evictar e criar um novo client do zero.
+const RECONNECT_WAIT_MS = 8_000;
 
 /* ─── Tipos ─── */
 interface Account {
@@ -91,26 +97,83 @@ class TelegramClientPool {
   private sessions   = new Map<string, string>();
   private connecting = new Map<string, Promise<TelegramClient>>();
 
+  /**
+   * Verifica se um client está genuinamente conectado e pronto para enviar.
+   *
+   * client.connected pode permanecer true durante um reconnect interno do gramjs
+   * porque o flag só é atualizado depois que a nova conexão é estabelecida.
+   * _sender._isConnected reflete o estado da camada TCP imediatamente.
+   */
+  private isHealthy(client: TelegramClient): boolean {
+    if (!client.connected) return false;
+    try {
+      const sender = (client as any)._sender;
+      if (!sender) return false;
+      // false = TCP caiu; undefined/true = ok
+      if (sender._isConnected === false) return false;
+      // Se o sender está ativamente tentando reconectar, não consideramos saudável.
+      if (sender._userDisconnected) return false;
+    } catch {}
+    return true;
+  }
+
+  /**
+   * Aguarda o gramjs terminar seu reconnect automático (até RECONNECT_WAIT_MS).
+   * Retorna true se ficou saudável, false se expirou.
+   */
+  private async waitForReconnect(client: TelegramClient, label: string): Promise<boolean> {
+    const deadline = Date.now() + RECONNECT_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (this.isHealthy(client)) return true;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    console.warn(`[pool] ${label}: reconnect interno não concluiu em ${RECONNECT_WAIT_MS}ms — evictando.`);
+    return false;
+  }
+
+  /** Remove um client morto do pool para forçar reconexão na próxima chamada. */
+  evict(accountId: string): void {
+    const existing = this.clients.get(accountId);
+    if (existing) {
+      try { existing.disconnect(); } catch {}
+      this.clients.delete(accountId);
+      this.sessions.delete(accountId);
+      console.log(`[pool] Evicted: ${accountId}`);
+    }
+  }
+
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
     const sessionInUse   = this.sessions.get(account.id);
     const sessionChanged = sessionInUse !== account.session_string;
 
-    // FIX BUG 4: retorna imediatamente se já está conectado e a session não mudou.
-    // Evita que o prewarm periódico derrube conexões vivas gerando AUTH_KEY_DUPLICATED.
-    if (existing?.connected && !sessionChanged) return existing;
+    if (existing && !sessionChanged) {
+      if (this.isHealthy(existing)) return existing;
+
+      // Cliente existe mas não está saudável. Pode ser o gramjs no meio de um
+      // reconnect automático. Aguarda antes de jogar fora.
+      const label = account.phone_number;
+      console.warn(`[pool] ${label}: client não-saudável detectado, aguardando reconnect interno...`);
+      const recovered = await this.waitForReconnect(existing, label);
+      if (recovered) {
+        console.log(`[pool] ${label}: reconnect interno concluído — reusando.`);
+        return existing;
+      }
+
+      // Não recuperou — evicta e cria um novo abaixo.
+      try { await existing.disconnect(); } catch {}
+      this.clients.delete(account.id);
+      this.sessions.delete(account.id);
+    }
 
     // FIX BUG 4: coalescing — se já há uma conexão em andamento para esta conta,
     // aguarda ela em vez de abrir uma segunda conexão simultânea.
     const inFlight = this.connecting.get(account.id);
     if (inFlight) return inFlight;
 
-    if (existing) {
+    if (existing && sessionChanged) {
       try { await existing.disconnect(); } catch {}
       this.clients.delete(account.id);
-    }
-
-    if (sessionChanged && sessionInUse) {
       console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
     }
 
@@ -126,9 +189,7 @@ class TelegramClientPool {
         await client.connect();
       } catch (err: any) {
         const msg = String(err?.message ?? err);
-        // FIX BUG 4: AUTH_KEY_DUPLICATED = outra conexão viva com a mesma chave
-        // (outro processo ou conexão zumbi). Desconecta, aguarda o Telegram liberar
-        // a chave e tenta reconectar uma única vez.
+        // FIX BUG 4: AUTH_KEY_DUPLICATED = outra conexão viva com a mesma chave.
         if (msg.includes("AUTH_KEY_DUPLICATED")) {
           console.warn(
             `[pool] AUTH_KEY_DUPLICATED para ${account.phone_number} — ` +
@@ -152,19 +213,18 @@ class TelegramClientPool {
     try {
       return await promise;
     } finally {
-      // FIX BUG 4: sempre limpa — inclusive em caso de erro,
-      // para não bloquear reconexões futuras para esta conta.
+      // FIX BUG 4: sempre limpa — inclusive em caso de erro.
       this.connecting.delete(account.id);
     }
   }
 
-  // FIX BUG 4: prewarm só conecta contas que ainda NÃO estão conectadas.
-  // Chamar prewarm a cada 30s em contas já conectadas era a causa raiz do AUTH_KEY_DUPLICATED.
+  // FIX BUG 4 + FIX BUG 6: prewarm só conecta quem realmente não está saudável.
   async prewarm(accounts: Account[]): Promise<void> {
     const toConnect = accounts.filter((a) => {
       const existing     = this.clients.get(a.id);
       const sessionInUse = this.sessions.get(a.id);
-      return !existing?.connected || sessionInUse !== a.session_string;
+      if (!existing || sessionInUse !== a.session_string) return true;
+      return !this.isHealthy(existing);
     });
 
     if (toConnect.length === 0) return;
@@ -363,7 +423,24 @@ async function trySendMember(
     logStatus = "sent";
     console.log(`[worker] ✓ ${member.id} (${account.phone_number})`);
   } catch (err) {
-    errorMsg  = err instanceof Error ? err.message : String(err);
+    errorMsg = err instanceof Error ? err.message : String(err);
+
+    // Se o TCP caiu durante o send, o gramjs vai tentar reconectar sozinho.
+    // Evictamos do pool para que a próxima tentativa (inline retry ou
+    // cross-invocation) obtenha um client fresco em vez de reusar o que está
+    // em estado de flux.
+    const isConnectionError =
+      /not connected/i.test(errorMsg) ||
+      /connection closed/i.test(errorMsg) ||
+      /TIMEOUT/.test(errorMsg);
+
+    if (isConnectionError) {
+      console.warn(
+        `[worker] Conexão perdida durante send para ${account.phone_number} — evictando do pool`
+      );
+      clientPool.evict(account.id);
+    }
+
     retryable = isRetryableError(errorMsg);
     console.error(
       `[worker] ✗ ${member.id} [${retryable ? "retryável" : "permanente"}] ` +
@@ -502,9 +579,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const group    = schedule.groups;
 
   // FIX BUG 5: janela estrita de 1 minuto.
-  // Se chegamos atrasados demais (ex: worker reiniciou, processo dormiu, reload atrasou),
-  // descarta o disparo silenciosamente e avança para a próxima semana.
-  // Não tenta enviar mensagem fora do minuto esperado pelo usuário.
   const lateMs = now.getTime() - new Date(schedule.next_run_at).getTime();
   if (lateMs > FIRE_WINDOW_MS) {
     console.warn(
@@ -741,7 +815,7 @@ async function prewarmAccounts(): Promise<void> {
     accountCache.set(account.id, account);
   }
 
-  // FIX BUG 4: prewarm filtrado — só conecta quem realmente precisa
+  // FIX BUG 4 + FIX BUG 6: prewarm filtrado — só conecta quem realmente precisa
   await clientPool.prewarm(accounts);
   prewarmRunning = false;
 }
