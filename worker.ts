@@ -8,6 +8,8 @@
 //      O reload é a ÚNICA fonte de timers — elimina double-fire após sucesso.
 //   3. [Fix Bug 3] Envio sequencial (for await) em vez de Promise.allSettled paralelo.
 //      Membros do mesmo grupo enviados um a vez — Telegram não rejeita o segundo send.
+//   4. [Fix Bug 4] AUTH_KEY_DUPLICATED: connection coalescing via mapa `connecting`.
+//      Concurrent callers em get() aguardam a mesma promise em vez de abrir duas conexões.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -88,8 +90,9 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  private clients  = new Map<string, TelegramClient>();
-  private sessions = new Map<string, string>();
+  private clients    = new Map<string, TelegramClient>();
+  private sessions   = new Map<string, string>();
+  private connecting = new Map<string, Promise<TelegramClient>>(); // FIX BUG 4
 
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
@@ -97,6 +100,11 @@ class TelegramClientPool {
     const sessionChanged = sessionInUse !== account.session_string;
 
     if (existing?.connected && !sessionChanged) return existing;
+
+    // FIX BUG 4: se já existe uma conexão em andamento para esta conta,
+    // aguarda ela em vez de abrir uma segunda — evita AUTH_KEY_DUPLICATED
+    const inFlight = this.connecting.get(account.id);
+    if (inFlight) return inFlight;
 
     if (existing) {
       try { await existing.disconnect(); } catch {}
@@ -107,17 +115,27 @@ class TelegramClientPool {
       console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
     }
 
-    const client = new TelegramClient(
-      new StringSession(account.session_string),
-      parseInt(account.api_id),
-      account.api_hash,
-      { connectionRetries: 3 }
-    );
-    await client.connect();
-    this.clients.set(account.id, client);
-    this.sessions.set(account.id, account.session_string);
-    console.log(`[pool] Conectado: ${account.phone_number}`);
-    return client;
+    const promise = (async () => {
+      const client = new TelegramClient(
+        new StringSession(account.session_string),
+        parseInt(account.api_id),
+        account.api_hash,
+        { connectionRetries: 3 }
+      );
+      await client.connect();
+      this.clients.set(account.id, client);
+      this.sessions.set(account.id, account.session_string);
+      console.log(`[pool] Conectado: ${account.phone_number}`);
+      return client;
+    })();
+
+    this.connecting.set(account.id, promise);
+    try {
+      return await promise;
+    } finally {
+      // FIX BUG 4: sempre limpa — inclusive em caso de erro, para não bloquear reconexões futuras
+      this.connecting.delete(account.id);
+    }
   }
 
   async prewarm(accounts: Account[]): Promise<void> {
@@ -127,6 +145,7 @@ class TelegramClientPool {
   }
 
   async disconnectAll(): Promise<void> {
+    this.connecting.clear(); // FIX BUG 4: cancela referências de conexões pendentes
     await Promise.all(
       [...this.clients.entries()].map(async ([id, client]) => {
         try { await client.disconnect(); } catch {}
