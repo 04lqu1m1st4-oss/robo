@@ -1,15 +1,11 @@
 // worker.ts — high-precision Telegram dispatch worker
 //
-// Fixes vs versão anterior:
-//   1. [Fix Bug 1+2] scheduledFireTimes: novo mapa rastreia o nextRunAt agendado.
-//      scheduleTimer só recria o timer se o horário mudou — senão ignora.
-//      Resolve reload re-agendando o mesmo schedule a cada 30s.
-//   2. [Fix Bug 2] scheduleTimer() removido de dentro do fireSchedule.
-//      O reload é a ÚNICA fonte de timers — elimina double-fire após sucesso.
-//   3. [Fix Bug 3] Envio sequencial (for await) em vez de Promise.allSettled paralelo.
-//      Membros do mesmo grupo enviados um a vez — Telegram não rejeita o segundo send.
-//   4. [Fix Bug 4] AUTH_KEY_DUPLICATED: connection coalescing via mapa `connecting`.
-//      Concurrent callers em get() aguardam a mesma promise em vez de abrir duas conexões.
+// Fixes:
+//   1. [Fix Bug 1+2] scheduledFireTimes: scheduleTimer idempotente — não recria timer com mesmo horário.
+//   2. [Fix Bug 2] scheduleTimer removido do fireSchedule — reload é a única fonte de timers.
+//   3. [Fix Bug 3] Envio sequencial (for await) — sem double-send paralelo.
+//   4. [Fix Bug 4] AUTH_KEY_DUPLICATED: connection coalescing + prewarm não reconecta conta já conectada.
+//   5. [Fix Bug 5] Janela de 1 minuto — se chegou atrasado > 60s, descarta e avança para próxima semana.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -22,6 +18,7 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
+const FIRE_WINDOW_MS         = 60_000;  // FIX BUG 5: descarta se atrasado mais de 1 minuto
 const SEND_TIMEOUT_MS        = 15_000;
 const INLINE_RETRY_BUDGET_MS = 50_000;
 
@@ -92,17 +89,19 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 class TelegramClientPool {
   private clients    = new Map<string, TelegramClient>();
   private sessions   = new Map<string, string>();
-  private connecting = new Map<string, Promise<TelegramClient>>(); // FIX BUG 4
+  private connecting = new Map<string, Promise<TelegramClient>>();
 
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
     const sessionInUse   = this.sessions.get(account.id);
     const sessionChanged = sessionInUse !== account.session_string;
 
+    // FIX BUG 4: retorna imediatamente se já está conectado e a session não mudou.
+    // Evita que o prewarm periódico derrube conexões vivas gerando AUTH_KEY_DUPLICATED.
     if (existing?.connected && !sessionChanged) return existing;
 
-    // FIX BUG 4: se já existe uma conexão em andamento para esta conta,
-    // aguarda ela em vez de abrir uma segunda — evita AUTH_KEY_DUPLICATED
+    // FIX BUG 4: coalescing — se já há uma conexão em andamento para esta conta,
+    // aguarda ela em vez de abrir uma segunda conexão simultânea.
     const inFlight = this.connecting.get(account.id);
     if (inFlight) return inFlight;
 
@@ -115,14 +114,34 @@ class TelegramClientPool {
       console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
     }
 
-    const promise = (async () => {
+    const promise = (async (): Promise<TelegramClient> => {
       const client = new TelegramClient(
         new StringSession(account.session_string),
         parseInt(account.api_id),
         account.api_hash,
         { connectionRetries: 3 }
       );
-      await client.connect();
+
+      try {
+        await client.connect();
+      } catch (err: any) {
+        const msg = String(err?.message ?? err);
+        // FIX BUG 4: AUTH_KEY_DUPLICATED = outra conexão viva com a mesma chave
+        // (outro processo ou conexão zumbi). Desconecta, aguarda o Telegram liberar
+        // a chave e tenta reconectar uma única vez.
+        if (msg.includes("AUTH_KEY_DUPLICATED")) {
+          console.warn(
+            `[pool] AUTH_KEY_DUPLICATED para ${account.phone_number} — ` +
+            `aguardando 4s para Telegram liberar a chave...`
+          );
+          try { await client.disconnect(); } catch {}
+          await new Promise((r) => setTimeout(r, 4_000));
+          await client.connect();
+        } else {
+          throw err;
+        }
+      }
+
       this.clients.set(account.id, client);
       this.sessions.set(account.id, account.session_string);
       console.log(`[pool] Conectado: ${account.phone_number}`);
@@ -133,19 +152,30 @@ class TelegramClientPool {
     try {
       return await promise;
     } finally {
-      // FIX BUG 4: sempre limpa — inclusive em caso de erro, para não bloquear reconexões futuras
+      // FIX BUG 4: sempre limpa — inclusive em caso de erro,
+      // para não bloquear reconexões futuras para esta conta.
       this.connecting.delete(account.id);
     }
   }
 
+  // FIX BUG 4: prewarm só conecta contas que ainda NÃO estão conectadas.
+  // Chamar prewarm a cada 30s em contas já conectadas era a causa raiz do AUTH_KEY_DUPLICATED.
   async prewarm(accounts: Account[]): Promise<void> {
-    console.log(`[pool] Pre-warming ${accounts.length} conta(s)...`);
-    await Promise.allSettled(accounts.map((a) => this.get(a)));
+    const toConnect = accounts.filter((a) => {
+      const existing     = this.clients.get(a.id);
+      const sessionInUse = this.sessions.get(a.id);
+      return !existing?.connected || sessionInUse !== a.session_string;
+    });
+
+    if (toConnect.length === 0) return;
+
+    console.log(`[pool] Pre-warming ${toConnect.length} conta(s) novas/desconectadas...`);
+    await Promise.allSettled(toConnect.map((a) => this.get(a)));
     console.log(`[pool] Pre-warm concluído.`);
   }
 
   async disconnectAll(): Promise<void> {
-    this.connecting.clear(); // FIX BUG 4: cancela referências de conexões pendentes
+    this.connecting.clear();
     await Promise.all(
       [...this.clients.entries()].map(async ([id, client]) => {
         try { await client.disconnect(); } catch {}
@@ -471,6 +501,35 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const schedule = rows as unknown as Schedule;
   const group    = schedule.groups;
 
+  // FIX BUG 5: janela estrita de 1 minuto.
+  // Se chegamos atrasados demais (ex: worker reiniciou, processo dormiu, reload atrasou),
+  // descarta o disparo silenciosamente e avança para a próxima semana.
+  // Não tenta enviar mensagem fora do minuto esperado pelo usuário.
+  const lateMs = now.getTime() - new Date(schedule.next_run_at).getTime();
+  if (lateMs > FIRE_WINDOW_MS) {
+    console.warn(
+      `[timer] Schedule ${scheduleId} atrasado ${Math.round(lateMs / 1000)}s > 60s — ` +
+      `descartando, avançando para próxima semana.`
+    );
+    let nextRun: string;
+    try {
+      nextRun = nextWeeklyOccurrence(schedule.cron_expression);
+    } catch (err) {
+      console.error(`[timer] cron inválido no schedule ${scheduleId}, desativando:`, err);
+      await supabase.from("schedules").update({ is_active: false }).eq("id", scheduleId);
+      return;
+    }
+    await supabase.from("schedules").update({
+      next_run_at:          nextRun,
+      retry_until:          null,
+      retry_count:          0,
+      last_attempt_at:      nowISO,
+      last_attempt_status:  "skipped",
+      last_attempt_error:   `Atrasado ${Math.round(lateMs / 1000)}s — janela de 60s expirada`,
+    }).eq("id", scheduleId);
+    return;
+  }
+
   if (!group?.telegram_chat_id) {
     console.warn(`[timer] Schedule ${scheduleId}: sem telegram_chat_id, pulando.`);
     return;
@@ -514,9 +573,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }).eq("id", scheduleId);
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
-    // FIX BUG 2: NÃO chama scheduleTimer aqui.
-    // O reload periódico (30s) vai encontrar o novo next_run_at no banco e agendar sozinho.
-    // Chamar scheduleTimer aqui + reload = double-fire garantido.
+    // FIX BUG 2: NÃO chama scheduleTimer aqui — reload periódico agenda sozinho.
 
   } else {
     const newRetryCount  = schedule.retry_count + 1;
@@ -551,30 +608,18 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
 /* ─── Mapa de timers ativos ─── */
 const scheduledTimers    = new Map<string, ReturnType<typeof setTimeout>>();
-// FIX BUG 1: rastreia qual nextRunAt está agendado por scheduleId
 const scheduledFireTimes = new Map<string, string>();
 
-/* ─── Agenda um precision timer para um schedule ─────────────────────────
-   FIX BUG 1+2: só cria/recria o timer se o nextRunAt mudou.
-   Se já existe um timer para o mesmo scheduleId com o mesmo horário, ignora.
-   Isso evita que o reload de 30s duplique disparos.                     ─── */
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
-  if (delay < -5000) {
-    // Já passou há mais de 5s — não agenda (retry ou reload vai pegar)
-    return;
-  }
+  if (delay < -5000) return;
 
   const existing       = scheduledTimers.get(scheduleId);
   const existingFireAt = scheduledFireTimes.get(scheduleId);
 
-  // FIX: se já existe timer para o mesmo horário, não recria
-  if (existing && existingFireAt === nextRunAt) {
-    return;
-  }
+  if (existing && existingFireAt === nextRunAt) return;
 
-  // Cancela timer anterior se existir (horário mudou, ex: retry resetou next_run_at)
   if (existing) {
     clearTimeout(existing);
     console.log(`[timer] ♻ Timer anterior cancelado para ${scheduleId} (horário mudou de ${existingFireAt} para ${nextRunAt})`);
@@ -639,7 +684,6 @@ async function reloadSchedules(): Promise<void> {
       .lte("retry_until", nowISO),
   ]);
 
-  // Limpa retries expirados
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando.`);
@@ -660,13 +704,10 @@ async function reloadSchedules(): Promise<void> {
     })
   );
 
-  // Agenda timers para schedules futuros dentro da janela de lookahead
-  // FIX BUG 1: scheduleTimer agora é idempotente — ignora se já existe timer para o mesmo horário
   for (const s of futureSchedules ?? []) {
     scheduleTimer(s.id, s.next_run_at);
   }
 
-  // Dispara retries cross-invocation que já são devidos
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
     if (isRetryDue(schedule, now) && !scheduledTimers.has(schedule.id)) {
@@ -700,6 +741,7 @@ async function prewarmAccounts(): Promise<void> {
     accountCache.set(account.id, account);
   }
 
+  // FIX BUG 4: prewarm filtrado — só conecta quem realmente precisa
   await clientPool.prewarm(accounts);
   prewarmRunning = false;
 }
