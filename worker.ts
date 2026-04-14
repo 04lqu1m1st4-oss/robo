@@ -3,7 +3,7 @@
 // Fixes:
 //   1. [Fix Bug 1+2] scheduledFireTimes: scheduleTimer idempotente — não recria timer com mesmo horário.
 //   2. [Fix Bug 2] scheduleTimer removido do fireSchedule — reload é a única fonte de timers.
-//   3. [Fix Bug 3] Envio sequencial (for await) — sem double-send paralelo.
+//   3. [Fix Bug 3 REVERTIDO → PARALELO] Promise.allSettled paralelo com lock por (scheduleId, accountId).
 //   4. [Fix Bug 4] AUTH_KEY_DUPLICATED: connection coalescing + prewarm não reconecta conta já conectada.
 //   5. [Fix Bug 5] Janela de 1 minuto — se chegou atrasado > 60s, descarta e avança para próxima semana.
 //   6. [Fix Bug 6] gramjs auto-reconnect: pool detecta cliente em reconexão via _sender._isConnected
@@ -90,6 +90,9 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
   console.log(`[peer] Resolvido e cacheado: ${telegramChatId}`);
   return peer;
 }
+
+/* ─── Lock de envio em andamento (evita double-send paralelo) ─── */
+const sendingLocks = new Set<string>();
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
@@ -462,7 +465,7 @@ async function trySendMember(
   return { member_id: member.id, account_id: account.id, status: logStatus, retryable, error: errorMsg };
 }
 
-/* ─── Processa membros sequencialmente (FIX BUG 3) ─── */
+/* ─── Processa membros em paralelo com lock por (scheduleId, accountId) ─── */
 async function processMembersOf(
   schedule: Schedule,
   skipAccountIds: string[] = []
@@ -514,16 +517,29 @@ async function processMembersOf(
 
     inlineAttempt++;
 
-    // FIX BUG 3: sequencial em vez de Promise.allSettled paralelo
-    const settled: PromiseSettledResult<MemberResult>[] = [];
-    for (const m of pending) {
-      try {
-        const result = await trySendMember(m, m.accounts!, group, schedule);
-        settled.push({ status: "fulfilled", value: result });
-      } catch (reason) {
-        settled.push({ status: "rejected", reason });
-      }
-    }
+    // Paralelo com lock por (scheduleId, accountId) — evita double-send
+    const settled = await Promise.allSettled(
+      pending.map(async (m) => {
+        const lockKey = `${schedule.id}:${m.accounts!.id}`;
+
+        if (sendingLocks.has(lockKey)) {
+          console.warn(`[worker] ⚠ Lock ativo para ${lockKey} — pulando para evitar double-send`);
+          return {
+            member_id:  m.id,
+            account_id: m.accounts!.id,
+            status:     "skipped" as const,
+            retryable:  false,
+          };
+        }
+
+        sendingLocks.add(lockKey);
+        try {
+          return await trySendMember(m, m.accounts!, group, schedule);
+        } finally {
+          sendingLocks.delete(lockKey);
+        }
+      })
+    );
 
     const stillPending: GroupMember[] = [];
     settled.forEach((outcome, i) => {
@@ -534,11 +550,11 @@ async function processMembersOf(
       } else {
         const errorMsg = String((outcome as PromiseRejectedResult).reason);
         finalResults.set(member.id, {
-          member_id: member.id,
+          member_id:  member.id,
           account_id: member.accounts!.id,
-          status: "failed",
-          retryable: true,
-          error: errorMsg,
+          status:     "failed",
+          retryable:  true,
+          error:      errorMsg,
         });
         stillPending.push(member);
       }
@@ -594,12 +610,12 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
     await supabase.from("schedules").update({
-      next_run_at:          nextRun,
-      retry_until:          null,
-      retry_count:          0,
-      last_attempt_at:      nowISO,
-      last_attempt_status:  "skipped",
-      last_attempt_error:   `Atrasado ${Math.round(lateMs / 1000)}s — janela de 60s expirada`,
+      next_run_at:         nextRun,
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "skipped",
+      last_attempt_error:  `Atrasado ${Math.round(lateMs / 1000)}s — janela de 60s expirada`,
     }).eq("id", scheduleId);
     return;
   }
@@ -641,9 +657,13 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }
 
     await supabase.from("schedules").update({
-      next_run_at: nextRun, last_run_at: nowISO,
-      retry_until: null, retry_count: 0,
-      last_attempt_at: nowISO, last_attempt_status: "sent", last_attempt_error: null,
+      next_run_at:         nextRun,
+      last_run_at:         nowISO,
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "sent",
+      last_attempt_error:  null,
     }).eq("id", scheduleId);
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
@@ -662,9 +682,11 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       .join("; ");
 
     await supabase.from("schedules").update({
-      retry_until: retryUntil, retry_count: newRetryCount,
-      last_attempt_at: nowISO, last_attempt_status: "retrying",
-      last_attempt_error: failedErrors || null,
+      retry_until:         retryUntil,
+      retry_count:         newRetryCount,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "retrying",
+      last_attempt_error:  failedErrors || null,
     }).eq("id", scheduleId);
 
     const intervalNext = calcRetryInterval(
@@ -769,10 +791,13 @@ async function reloadSchedules(): Promise<void> {
         return;
       }
       await supabase.from("schedules").update({
-        next_run_at: nextRun, last_run_at: nowISO,
-        retry_until: null, retry_count: 0,
-        last_attempt_at: nowISO, last_attempt_status: "failed",
-        last_attempt_error: "Retry expirou sem sucesso total",
+        next_run_at:         nextRun,
+        last_run_at:         nowISO,
+        retry_until:         null,
+        retry_count:         0,
+        last_attempt_at:     nowISO,
+        last_attempt_status: "failed",
+        last_attempt_error:  "Retry expirou sem sucesso total",
       }).eq("id", expired.id);
       scheduleTimer(expired.id, nextRun);
     })
@@ -822,7 +847,7 @@ async function prewarmAccounts(): Promise<void> {
 
 /* ─── Inicialização ─── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando — precision timers + peer cache + fast retry + envio sequencial");
+  console.log("[worker] Iniciando — precision timers + peer cache + fast retry + envio paralelo com lock");
 
   await Promise.all([
     prewarmAccounts(),
