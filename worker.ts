@@ -7,6 +7,7 @@
 //   ✓ Disparo paralelo por membro (contas distintas, mesmo ou múltiplos grupos)
 //   ✓ Nenhum erro é considerado permanente dentro da janela de 60s
 //   ✓ Supabase Realtime para detectar schedules novos/alterados instantaneamente
+//   ✓ isHealthy robusto: detecta reconnect interno do GramJS e evicta corretamente
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -19,13 +20,12 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const SEND_TIMEOUT_MS  = 10_000; // timeout por tentativa de envio
-const RETRY_BASE_MS    = 300;    // backoff começa em 300ms (queremos velocidade)
-const RETRY_MAX_MS     = 3_000;  // máximo 3s entre tentativas (dentro da janela de 60s)
-const DISCARD_AFTER_MS = 60_000; // descarta se passou >60s do horário original
-const LOOKAHEAD_MS     = 10 * 60 * 1000; // carrega schedules das próximas 10 min no boot
+const SEND_TIMEOUT_MS  = 10_000;
+const RETRY_BASE_MS    = 300;
+const RETRY_MAX_MS     = 3_000;
+const DISCARD_AFTER_MS = 60_000;
+const LOOKAHEAD_MS     = 10 * 60 * 1000;
 
-// Milissegundos antes do disparo para cada etapa de pre-warm
 const PREWARM_STEPS_MS = [60_000, 30_000, 10_000, 5_000, 3_000, 2_000, 1_000];
 
 /* ─── Tipos ─── */
@@ -82,14 +82,54 @@ class TelegramClientPool {
   private sessions   = new Map<string, string>();
   private connecting = new Map<string, Promise<TelegramClient>>();
 
+  /**
+   * Verifica saúde real do client.
+   *
+   * Problema anterior: durante o reconnect interno do GramJS,
+   * `client.connected` retorna `true` mas o sender está em estado
+   * de reconexão — causando envios para um client morto.
+   *
+   * Solução: inspecionamos o estado interno do sender de forma
+   * defensiva e consideramos não-saudável qualquer estado ambíguo.
+   */
   private isHealthy(client: TelegramClient): boolean {
+    // 1. Verificação básica da prop pública
     if (!client.connected) return false;
+
     try {
       const sender = (client as any)._sender;
+
+      // Sem sender → morto
       if (!sender) return false;
+
+      // Reconectando ativamente → não usar agora
+      if (sender._reconnecting === true) return false;
+
+      // Explicitamente desconectado
       if (sender._isConnected === false) return false;
-      if (sender._userDisconnected) return false;
-    } catch {}
+      if (sender._userDisconnected === true) return false;
+
+      // Se há uma promessa de reconexão pendente → instável
+      if (sender._reconnect instanceof Promise) return false;
+
+      // Verifica se o loop de receive ainda está rodando
+      // GramJS seta _recvLoopRunning = false quando a conexão cai
+      if (sender._recvLoopRunning === false) return false;
+
+      // Verifica se o transporte TCP está conectado
+      const connection = sender._connection;
+      if (connection) {
+        if (connection._connected === false) return false;
+        if (connection._socket === null || connection._socket === undefined) return false;
+        // Checa readyState do socket (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)
+        const socket = connection._socket;
+        if (typeof socket.readyState === "number" && socket.readyState !== 1) return false;
+      }
+    } catch {
+      // Qualquer erro de introspecção → considera não-saudável
+      return false;
+    }
+
     return true;
   }
 
@@ -111,11 +151,12 @@ class TelegramClientPool {
       return existing;
     }
 
-    // Evicta se sessão mudou ou morreu
+    // Evicta se sessão mudou, morreu, ou está em estado ambíguo de reconexão
     if (existing) {
       try { await existing.disconnect(); } catch {}
       this.clients.delete(account.id);
       this.sessions.delete(account.id);
+      console.log(`[pool] Client evictado por isHealthy=false: ${account.phone_number}`);
     }
 
     // Coalescing: evita múltiplas conexões simultâneas para a mesma conta
@@ -127,7 +168,12 @@ class TelegramClientPool {
         new StringSession(account.session_string),
         parseInt(account.api_id),
         account.api_hash,
-        { connectionRetries: 5 }
+        {
+          connectionRetries: 5,
+          // Aumenta o timeout de reconexão para dar tempo ao GramJS
+          // recuperar sozinho antes de tentarmos um reconnect manual
+          retryDelay: 1_000,
+        }
       );
 
       try {
@@ -211,17 +257,9 @@ function nextWeeklyOccurrence(cronExpression: string): string {
 }
 
 /* ─── Estado global de timers ─── */
-
-// Todos os timers ativos por scheduleId (prewarm + disparo)
-// Armazena múltiplos timers por schedule (os steps de prewarm)
 const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
-
-// Lock de disparo: scheduleId → timestamp do início do disparo
-const firingLocks = new Map<string, number>();
-
-// Controle de envio já realizado neste ciclo: "scheduleId:memberId"
-// Limpa automaticamente após o fireSchedule terminar
-const sentSet = new Set<string>();
+const firingLocks     = new Map<string, number>();
+const sentSet         = new Set<string>();
 
 /* ─── Busca schedule completo do banco ─── */
 async function fetchSchedule(scheduleId: string): Promise<Schedule | null> {
@@ -278,7 +316,6 @@ async function sendMessage(
         return;
       }
 
-      // FloodWait: espera e retenta dentro da mesma tentativa
       const isFlood =
         err?.seconds != null ||
         err?.constructor?.name === "FloodWaitError" ||
@@ -336,7 +373,6 @@ function scheduleAll(scheduleId: string, nextRunAt: string): void {
   const now     = Date.now();
   const delay   = fireAt - now;
 
-  // Passou mais de 60s atrás? Ignora — será tratado no próximo ciclo semanal.
   if (delay < -DISCARD_AFTER_MS) {
     console.warn(
       `[timer] Schedule ${scheduleId} passou ${Math.round(-delay / 1000)}s atrás — ignorando.`
@@ -344,15 +380,13 @@ function scheduleAll(scheduleId: string, nextRunAt: string): void {
     return;
   }
 
-  // Não recria se já existe um conjunto de timers para este schedule
   if (scheduledTimers.has(scheduleId)) return;
 
   const timers: ReturnType<typeof setTimeout>[] = [];
 
-  // ── Pre-warm steps ──────────────────────────────────────────────────────────
   for (const stepMs of PREWARM_STEPS_MS) {
     const stepDelay = delay - stepMs;
-    if (stepDelay <= 0) continue; // já passamos desta janela, pula
+    if (stepDelay <= 0) continue;
 
     const t = setTimeout(async () => {
       console.log(
@@ -364,7 +398,6 @@ function scheduleAll(scheduleId: string, nextRunAt: string): void {
     timers.push(t);
   }
 
-  // ── Timer principal de disparo ──────────────────────────────────────────────
   const effectiveDelay = Math.max(0, delay);
   const fireTimer = setTimeout(async () => {
     scheduledTimers.delete(scheduleId);
@@ -383,7 +416,6 @@ function scheduleAll(scheduleId: string, nextRunAt: string): void {
 
 /* ─── Dispara um schedule ─── */
 async function fireSchedule(scheduleId: string, scheduledFireAt: number): Promise<void> {
-  // ── Lock: nunca double-fire ────────────────────────────────────────────────
   if (firingLocks.has(scheduleId)) {
     console.warn(`[fire] Schedule ${scheduleId} já está sendo processado — ignorando.`);
     return;
@@ -414,7 +446,6 @@ async function fireSchedule(scheduleId: string, scheduledFireAt: number): Promis
       return;
     }
 
-    // Dispara todos os membros em paralelo, cada um com retry até esgotar janela
     const results = await Promise.allSettled(
       members.map((member) =>
         sendMemberWithRetry(member, group, schedule, scheduledFireAt)
@@ -431,45 +462,29 @@ async function fireSchedule(scheduleId: string, scheduledFireAt: number): Promis
       );
     }
 
-    if (anySuccess) {
-      // Avança para próxima semana
-      const nextRun = nextWeeklyOccurrence(schedule.cron_expression);
-      await supabase.from("schedules").update({
-        next_run_at:         nextRun,
-        last_run_at:         new Date().toISOString(),
-        retry_until:         null,
-        retry_count:         0,
-        last_attempt_at:     new Date().toISOString(),
-        last_attempt_status: allSuccess ? "sent" : "partial",
-        last_attempt_error:  null,
-      }).eq("id", scheduleId);
+    const nextRun = nextWeeklyOccurrence(schedule.cron_expression);
 
-      console.log(`[fire] ✓ Schedule ${scheduleId} completo. Próxima: ${nextRun}`);
+    await supabase.from("schedules").update({
+      next_run_at:         nextRun,
+      last_run_at:         new Date().toISOString(),
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     new Date().toISOString(),
+      last_attempt_status: anySuccess ? (allSuccess ? "sent" : "partial") : "failed",
+      last_attempt_error:  anySuccess ? null : "Janela de 60s esgotada sem envio bem-sucedido.",
+    }).eq("id", scheduleId);
 
-      // Agenda próxima ocorrência
-      scheduleAll(scheduleId, nextRun);
-    } else {
-      // Nenhum membro enviou — janela esgotada para todos
-      console.error(
-        `[fire] ✗ Schedule ${scheduleId}: nenhum membro conseguiu enviar dentro da janela.`
-      );
-      // Ainda assim avança — não queremos travar o schedule para sempre
-      const nextRun = nextWeeklyOccurrence(schedule.cron_expression);
-      await supabase.from("schedules").update({
-        next_run_at:         nextRun,
-        last_run_at:         new Date().toISOString(),
-        last_attempt_at:     new Date().toISOString(),
-        last_attempt_status: "failed",
-        last_attempt_error:  "Janela de 60s esgotada sem envio bem-sucedido.",
-      }).eq("id", scheduleId);
+    console.log(
+      anySuccess
+        ? `[fire] ✓ Schedule ${scheduleId} completo. Próxima: ${nextRun}`
+        : `[fire] ✗ Schedule ${scheduleId}: nenhum membro enviou dentro da janela.`
+    );
 
-      scheduleAll(scheduleId, nextRun);
-    }
+    scheduleAll(scheduleId, nextRun);
 
   } finally {
-    // Limpa locks e sentSet deste ciclo
     firingLocks.delete(scheduleId);
-    for (const key of sentSet) {
+    for (const key of [...sentSet]) {
       if (key.startsWith(`${scheduleId}:`)) sentSet.delete(key);
     }
   }
@@ -482,11 +497,10 @@ async function sendMemberWithRetry(
   schedule: Schedule,
   scheduledFireAt: number
 ): Promise<void> {
-  const account    = member.accounts!;
-  const sentKey    = `${schedule.id}:${member.id}`;
-  let   attempt    = 0;
+  const account = member.accounts!;
+  const sentKey = `${schedule.id}:${member.id}`;
+  let attempt   = 0;
 
-  // Garante que não enviamos este membro mais de uma vez neste ciclo
   if (sentSet.has(sentKey)) {
     console.warn(`[send] Membro ${member.id} já enviado neste ciclo — ignorando.`);
     return;
@@ -495,13 +509,12 @@ async function sendMemberWithRetry(
   while (true) {
     attempt++;
 
-    // ── Verifica janela de tempo ──────────────────────────────────────────────
     const elapsed = Date.now() - scheduledFireAt;
     if (elapsed > DISCARD_AFTER_MS) {
       const msg = `Janela de ${DISCARD_AFTER_MS / 1000}s esgotada após ${attempt - 1} tentativa(s).`;
       console.warn(`[send] ✗ Descartando membro ${member.id} (${account.phone_number}): ${msg}`);
 
-      await supabase.from("dispatch_logs").insert({
+      supabase.from("dispatch_logs").insert({
         user_id:       schedule.user_id,
         group_id:      group.id,
         account_id:    account.id,
@@ -516,17 +529,17 @@ async function sendMemberWithRetry(
     }
 
     try {
+      // Sempre pede o client ao pool — se não estiver saudável, ele reconecta
       const client = await clientPool.get(account);
       await sendMessage(client, group.telegram_chat_id!, member.message_text ?? "");
 
-      // ── Sucesso ────────────────────────────────────────────────────────────
-      sentSet.add(sentKey); // marca como enviado neste ciclo
+      sentSet.add(sentKey);
       console.log(
         `[send] ✓ Membro ${member.id} (${account.phone_number}) — tentativa ${attempt} ` +
         `(+${Date.now() - scheduledFireAt}ms)`
       );
 
-      await supabase.from("dispatch_logs").insert({
+      supabase.from("dispatch_logs").insert({
         user_id:       schedule.user_id,
         group_id:      group.id,
         account_id:    account.id,
@@ -540,27 +553,30 @@ async function sendMemberWithRetry(
       return;
 
     } catch (err: any) {
-      // Não propaga se for o erro de "janela esgotada" (já tratado acima)
       if (err?.message?.includes("esgotada")) throw err;
 
       const errorMsg = err instanceof Error ? err.message : String(err);
 
-      // Erros de conexão → evicta para pegar client fresco
+      // Qualquer erro de conexão/transporte → evicta para forçar reconexão limpa
       const isConnError =
-        /not connected/i.test(errorMsg)  ||
-        /connection closed/i.test(errorMsg) ||
-        /TIMEOUT/.test(errorMsg);
+        /not connected/i.test(errorMsg)       ||
+        /connection closed/i.test(errorMsg)   ||
+        /Cannot read properties/i.test(errorMsg) || // readUInt32LE e afins
+        /BinaryReader/i.test(errorMsg)        ||
+        /TIMEOUT/.test(errorMsg)              ||
+        /reconnect/i.test(errorMsg);
 
-      if (isConnError) clientPool.evict(account.id);
+      if (isConnError) {
+        clientPool.evict(account.id);
+        console.warn(`[send] Evictado ${account.phone_number} por erro de conexão: ${errorMsg}`);
+      }
 
-      // Backoff exponencial, mas limitado (queremos ser rápidos dentro dos 60s)
       const backoffMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), RETRY_MAX_MS);
       console.warn(
         `[send] ✗ Membro ${member.id} (${account.phone_number}) tentativa ${attempt} ` +
         `— retry em ${backoffMs}ms: ${errorMsg}`
       );
 
-      // Log de falha (não-bloqueante)
       supabase.from("dispatch_logs").insert({
         user_id:       schedule.user_id,
         group_id:      group.id,
@@ -573,7 +589,6 @@ async function sendMemberWithRetry(
       }).then(() => {});
 
       await sleep(backoffMs);
-      // Continua tentando...
     }
   }
 }
