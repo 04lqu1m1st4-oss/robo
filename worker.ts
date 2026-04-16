@@ -9,7 +9,6 @@
 //   ✓ Supabase Realtime para detectar schedules novos/alterados instantaneamente
 //   ✓ isHealthy robusto: detecta reconnect interno do GramJS e evicta corretamente
 //   ✓ [FIX] Logger.setLevel("error") — suprime logs internos de INFO/WARN do GramJS
-//   ✓ [FIX] pingInterval: 60_000 — keepalive para reduzir drops de conexão ociosa
 //   ✓ [FIX] Aguarda 2s antes de evictar — evita race condition com reconnect interno
 
 import { createClient } from "@supabase/supabase-js";
@@ -200,10 +199,8 @@ class TelegramClientPool {
         {
           connectionRetries: 5,
           retryDelay: 1_000,
-          // [FIX] Keepalive: envia ping a cada 60s para evitar que o Telegram
-          // feche conexões ociosas (~90s timeout), reduzindo drasticamente
-          // a frequência dos logs de "Connection closed / reconnecting".
-          pingInterval: 60_000,
+          // GramJS já envia PingDelayDisconnect internamente para manter
+          // a conexão viva — não é necessário configurar um ping manual.
         }
       );
 
@@ -591,11 +588,11 @@ async function sendMemberWithRetry(
       // Qualquer erro de conexão/transporte → aguarda possível reconnect
       // interno do GramJS antes de evictar, para evitar race condition
       const isConnError =
-        /not connected/i.test(errorMsg)         ||
-        /connection closed/i.test(errorMsg)     ||
-        /Cannot read properties/i.test(errorMsg)||
-        /BinaryReader/i.test(errorMsg)          ||
-        /TIMEOUT/.test(errorMsg)               ||
+        /not connected/i.test(errorMsg)          ||
+        /connection closed/i.test(errorMsg)      ||
+        /Cannot read properties/i.test(errorMsg) ||
+        /BinaryReader/i.test(errorMsg)           ||
+        /TIMEOUT/.test(errorMsg)                 ||
         /reconnect/i.test(errorMsg);
 
       if (isConnError) {
