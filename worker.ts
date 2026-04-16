@@ -10,6 +10,8 @@
 //   ✓ isHealthy robusto: detecta reconnect interno do GramJS e evicta corretamente
 //   ✓ [FIX] Logger.setLevel("error") — suprime logs internos de INFO/WARN do GramJS
 //   ✓ [FIX] Aguarda 2s antes de evictar — evita race condition com reconnect interno
+//   ✓ [FIX] peerCache namespaceado por accountId — evita peer errado entre contas
+//   ✓ [FIX] loadSchedules sem filtro de lookahead — carrega todos os schedules ativos
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -17,8 +19,6 @@ import { StringSession } from "telegram/sessions";
 import { Logger } from "telegram/extensions";
 
 /* ─── [FIX] Suprime logs internos de INFO/WARN do GramJS ─── */
-/* Elimina os logs de "Connection closed while receiving data",  */
-/* "Started reconnecting", "Connecting to ...", etc.             */
 Logger.setLevel("error");
 
 /* ─── Supabase ─── */
@@ -32,7 +32,6 @@ const SEND_TIMEOUT_MS  = 10_000;
 const RETRY_BASE_MS    = 300;
 const RETRY_MAX_MS     = 3_000;
 const DISCARD_AFTER_MS = 60_000;
-const LOOKAHEAD_MS     = 10 * 60 * 1000;
 
 const PREWARM_STEPS_MS = [60_000, 30_000, 10_000, 5_000, 3_000, 2_000, 1_000];
 
@@ -67,20 +66,27 @@ interface Schedule {
   groups: Group;
 }
 
-/* ─── Peer cache ─── */
-const peerCache = new Map<string, unknown>();
+/* ─── Peer cache ─────────────────────────────────────────────────────────────
+   [FIX] Chave composta por accountId + telegramChatId.
+   O access_hash dentro de um InputPeer é específico por conta — usar o peer
+   de uma conta em outra faz o Telegram resolver para um chat completamente
+   diferente (causava envios no grupo errado).
+─────────────────────────────────────────────────────────────────────────── */
+const peerCache = new Map<string, unknown>(); // chave: `${accountId}:${telegramChatId}`
 
 async function getOrResolvePeer(
   client: TelegramClient,
+  accountId: string,
   telegramChatId: string
 ): Promise<unknown> {
-  if (peerCache.has(telegramChatId)) return peerCache.get(telegramChatId)!;
+  const key = `${accountId}:${telegramChatId}`;
+  if (peerCache.has(key)) return peerCache.get(key)!;
   const chatIdNum = parseInt(telegramChatId, 10);
   const peer = await client.getInputEntity(
     isNaN(chatIdNum) ? telegramChatId : chatIdNum
   );
-  peerCache.set(telegramChatId, peer);
-  console.log(`[peer] Resolvido e cacheado: ${telegramChatId}`);
+  peerCache.set(key, peer);
+  console.log(`[peer] Resolvido e cacheado: ${key}`);
   return peer;
 }
 
@@ -90,51 +96,27 @@ class TelegramClientPool {
   private sessions   = new Map<string, string>();
   private connecting = new Map<string, Promise<TelegramClient>>();
 
-  /**
-   * Verifica saúde real do client.
-   *
-   * Problema anterior: durante o reconnect interno do GramJS,
-   * `client.connected` retorna `true` mas o sender está em estado
-   * de reconexão — causando envios para um client morto.
-   *
-   * Solução: inspecionamos o estado interno do sender de forma
-   * defensiva e consideramos não-saudável qualquer estado ambíguo.
-   */
   private isHealthy(client: TelegramClient): boolean {
-    // 1. Verificação básica da prop pública
     if (!client.connected) return false;
 
     try {
       const sender = (client as any)._sender;
 
-      // Sem sender → morto
       if (!sender) return false;
-
-      // Reconectando ativamente → não usar agora
       if (sender._reconnecting === true) return false;
-
-      // Explicitamente desconectado
       if (sender._isConnected === false) return false;
       if (sender._userDisconnected === true) return false;
-
-      // Se há uma promessa de reconexão pendente → instável
       if (sender._reconnect instanceof Promise) return false;
-
-      // Verifica se o loop de receive ainda está rodando
-      // GramJS seta _recvLoopRunning = false quando a conexão cai
       if (sender._recvLoopRunning === false) return false;
 
-      // Verifica se o transporte TCP está conectado
       const connection = sender._connection;
       if (connection) {
         if (connection._connected === false) return false;
         if (connection._socket === null || connection._socket === undefined) return false;
-        // Checa readyState do socket (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)
         const socket = connection._socket;
         if (typeof socket.readyState === "number" && socket.readyState !== 1) return false;
       }
     } catch {
-      // Qualquer erro de introspecção → considera não-saudável
       return false;
     }
 
@@ -151,11 +133,6 @@ class TelegramClientPool {
     }
   }
 
-  /**
-   * [FIX] Aguarda o reconnect interno do GramJS terminar antes de evictar.
-   * Evita race condition onde evictamos um client que já estava se recuperando
-   * sozinho, gerando duas conexões simultâneas.
-   */
   async evictIfStillUnhealthy(accountId: string, phone: string): Promise<void> {
     const client = this.clients.get(accountId);
     if (!client) return;
@@ -179,7 +156,6 @@ class TelegramClientPool {
       return existing;
     }
 
-    // Evicta se sessão mudou, morreu, ou está em estado ambíguo de reconexão
     if (existing) {
       try { await existing.disconnect(); } catch {}
       this.clients.delete(account.id);
@@ -187,7 +163,6 @@ class TelegramClientPool {
       console.log(`[pool] Client evictado por isHealthy=false: ${account.phone_number}`);
     }
 
-    // Coalescing: evita múltiplas conexões simultâneas para a mesma conta
     const inFlight = this.connecting.get(account.id);
     if (inFlight) return inFlight;
 
@@ -199,8 +174,6 @@ class TelegramClientPool {
         {
           connectionRetries: 5,
           retryDelay: 1_000,
-          // GramJS já envia PingDelayDisconnect internamente para manter
-          // a conexão viva — não é necessário configurar um ping manual.
         }
       );
 
@@ -310,6 +283,7 @@ async function fetchSchedule(scheduleId: string): Promise<Schedule | null> {
 /* ─── Envia mensagem com timeout por tentativa ─── */
 async function sendMessage(
   client: TelegramClient,
+  accountId: string,
   telegramChatId: string,
   messageText: string
 ): Promise<void> {
@@ -320,12 +294,13 @@ async function sendMessage(
   const send = (async () => {
     let peer: unknown;
     try {
-      peer = await getOrResolvePeer(client, telegramChatId);
+      peer = await getOrResolvePeer(client, accountId, telegramChatId);
     } catch {
-      peerCache.delete(telegramChatId);
+      const key = `${accountId}:${telegramChatId}`;
+      peerCache.delete(key);
       const chatIdNum = parseInt(telegramChatId, 10);
       peer = await client.getInputEntity(isNaN(chatIdNum) ? telegramChatId : chatIdNum);
-      peerCache.set(telegramChatId, peer);
+      peerCache.set(key, peer);
     }
 
     try {
@@ -334,12 +309,13 @@ async function sendMessage(
       const msg = String(err?.message ?? "");
 
       if (msg.includes("PEER_ID_INVALID")) {
-        peerCache.delete(telegramChatId);
+        const key = `${accountId}:${telegramChatId}`;
+        peerCache.delete(key);
         const chatIdNum = parseInt(telegramChatId, 10);
         const freshPeer = await client.getInputEntity(
           isNaN(chatIdNum) ? telegramChatId : chatIdNum
         );
-        peerCache.set(telegramChatId, freshPeer);
+        peerCache.set(key, freshPeer);
         await client.sendMessage(freshPeer as any, { message: messageText });
         return;
       }
@@ -353,7 +329,7 @@ async function sendMessage(
         const waitSecs: number = err.seconds ?? 30;
         console.warn(`[send] FloodWait ${waitSecs}s`);
         await sleep(waitSecs * 1_000);
-        const freshPeer = await getOrResolvePeer(client, telegramChatId);
+        const freshPeer = await getOrResolvePeer(client, accountId, telegramChatId);
         await client.sendMessage(freshPeer as any, { message: messageText });
         return;
       }
@@ -376,9 +352,7 @@ async function prewarmScheduleAccounts(scheduleId: string): Promise<void> {
 
   if (members.length === 0) return;
 
-  console.log(
-    `[prewarm] Schedule ${scheduleId}: conectando ${members.length} conta(s)...`
-  );
+  console.log(`[prewarm] Schedule ${scheduleId}: conectando ${members.length} conta(s)...`);
 
   await Promise.allSettled(
     members.map((m) => clientPool.ensureConnected(m.accounts!))
@@ -417,9 +391,7 @@ function scheduleAll(scheduleId: string, nextRunAt: string): void {
     if (stepDelay <= 0) continue;
 
     const t = setTimeout(async () => {
-      console.log(
-        `[prewarm] ⚡ ${stepMs / 1000}s antes do disparo — schedule ${scheduleId}`
-      );
+      console.log(`[prewarm] ⚡ ${stepMs / 1000}s antes do disparo — schedule ${scheduleId}`);
       await prewarmScheduleAccounts(scheduleId);
     }, stepDelay);
 
@@ -557,9 +529,8 @@ async function sendMemberWithRetry(
     }
 
     try {
-      // Sempre pede o client ao pool — se não estiver saudável, ele reconecta
       const client = await clientPool.get(account);
-      await sendMessage(client, group.telegram_chat_id!, member.message_text ?? "");
+      await sendMessage(client, account.id, group.telegram_chat_id!, member.message_text ?? "");
 
       sentSet.add(sentKey);
       console.log(
@@ -585,8 +556,6 @@ async function sendMemberWithRetry(
 
       const errorMsg = err instanceof Error ? err.message : String(err);
 
-      // Qualquer erro de conexão/transporte → aguarda possível reconnect
-      // interno do GramJS antes de evictar, para evitar race condition
       const isConnError =
         /not connected/i.test(errorMsg)          ||
         /connection closed/i.test(errorMsg)      ||
@@ -596,9 +565,6 @@ async function sendMemberWithRetry(
         /reconnect/i.test(errorMsg);
 
       if (isConnError) {
-        // [FIX] Aguarda 2s para ver se o GramJS se recupera sozinho antes
-        // de evictar. Evita criar uma nova conexão desnecessária enquanto
-        // o reconnect interno já estava em andamento.
         await clientPool.evictIfStillUnhealthy(account.id, account.phone_number);
       }
 
@@ -624,15 +590,18 @@ async function sendMemberWithRetry(
   }
 }
 
-/* ─── Carrega schedules ativos no boot ─── */
+/* ─── Carrega schedules ativos no boot ────────────────────────────────────────
+   [FIX] Removido o filtro de lookahead (lte next_run_at).
+   O filtro anterior ignorava qualquer schedule com next_run_at > agora+10min,
+   fazendo o worker "perder" schedules existentes no banco ao reiniciar.
+   O scheduleAll já descarta schedules muito no passado e timers no futuro
+   não custam nada em memória.
+─────────────────────────────────────────────────────────────────────────── */
 async function loadSchedules(): Promise<void> {
-  const lookaheadISO = new Date(Date.now() + LOOKAHEAD_MS).toISOString();
-
   const { data, error } = await supabase
     .from("schedules")
     .select("id, next_run_at")
-    .eq("is_active", true)
-    .lte("next_run_at", lookaheadISO);
+    .eq("is_active", true);
 
   if (error) {
     console.error("[load] Erro ao carregar schedules:", error.message);
