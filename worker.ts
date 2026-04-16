@@ -8,10 +8,19 @@
 //   ✓ Nenhum erro é considerado permanente dentro da janela de 60s
 //   ✓ Supabase Realtime para detectar schedules novos/alterados instantaneamente
 //   ✓ isHealthy robusto: detecta reconnect interno do GramJS e evicta corretamente
+//   ✓ [FIX] Logger.setLevel("error") — suprime logs internos de INFO/WARN do GramJS
+//   ✓ [FIX] pingInterval: 60_000 — keepalive para reduzir drops de conexão ociosa
+//   ✓ [FIX] Aguarda 2s antes de evictar — evita race condition com reconnect interno
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
+import { Logger } from "telegram/extensions";
+
+/* ─── [FIX] Suprime logs internos de INFO/WARN do GramJS ─── */
+/* Elimina os logs de "Connection closed while receiving data",  */
+/* "Started reconnecting", "Connecting to ...", etc.             */
+Logger.setLevel("error");
 
 /* ─── Supabase ─── */
 const supabase = createClient(
@@ -143,6 +152,26 @@ class TelegramClientPool {
     }
   }
 
+  /**
+   * [FIX] Aguarda o reconnect interno do GramJS terminar antes de evictar.
+   * Evita race condition onde evictamos um client que já estava se recuperando
+   * sozinho, gerando duas conexões simultâneas.
+   */
+  async evictIfStillUnhealthy(accountId: string, phone: string): Promise<void> {
+    const client = this.clients.get(accountId);
+    if (!client) return;
+
+    console.log(`[pool] Aguardando 2s para ver se ${phone} se recupera sozinho...`);
+    await sleep(2_000);
+
+    if (!this.isHealthy(client)) {
+      this.evict(accountId);
+      console.warn(`[pool] Evictado ${phone} após aguardar reconnect interno.`);
+    } else {
+      console.log(`[pool] Client ${phone} se recuperou sozinho — mantendo conexão.`);
+    }
+  }
+
   async get(account: Account): Promise<TelegramClient> {
     const existing     = this.clients.get(account.id);
     const sessionInUse = this.sessions.get(account.id);
@@ -170,9 +199,11 @@ class TelegramClientPool {
         account.api_hash,
         {
           connectionRetries: 5,
-          // Aumenta o timeout de reconexão para dar tempo ao GramJS
-          // recuperar sozinho antes de tentarmos um reconnect manual
           retryDelay: 1_000,
+          // [FIX] Keepalive: envia ping a cada 60s para evitar que o Telegram
+          // feche conexões ociosas (~90s timeout), reduzindo drasticamente
+          // a frequência dos logs de "Connection closed / reconnecting".
+          pingInterval: 60_000,
         }
       );
 
@@ -557,18 +588,21 @@ async function sendMemberWithRetry(
 
       const errorMsg = err instanceof Error ? err.message : String(err);
 
-      // Qualquer erro de conexão/transporte → evicta para forçar reconexão limpa
+      // Qualquer erro de conexão/transporte → aguarda possível reconnect
+      // interno do GramJS antes de evictar, para evitar race condition
       const isConnError =
-        /not connected/i.test(errorMsg)       ||
-        /connection closed/i.test(errorMsg)   ||
-        /Cannot read properties/i.test(errorMsg) || // readUInt32LE e afins
-        /BinaryReader/i.test(errorMsg)        ||
-        /TIMEOUT/.test(errorMsg)              ||
+        /not connected/i.test(errorMsg)         ||
+        /connection closed/i.test(errorMsg)     ||
+        /Cannot read properties/i.test(errorMsg)||
+        /BinaryReader/i.test(errorMsg)          ||
+        /TIMEOUT/.test(errorMsg)               ||
         /reconnect/i.test(errorMsg);
 
       if (isConnError) {
-        clientPool.evict(account.id);
-        console.warn(`[send] Evictado ${account.phone_number} por erro de conexão: ${errorMsg}`);
+        // [FIX] Aguarda 2s para ver se o GramJS se recupera sozinho antes
+        // de evictar. Evita criar uma nova conexão desnecessária enquanto
+        // o reconnect interno já estava em andamento.
+        await clientPool.evictIfStillUnhealthy(account.id, account.phone_number);
       }
 
       const backoffMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), RETRY_MAX_MS);
