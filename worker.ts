@@ -7,6 +7,7 @@
 //   3. Fast retry para grupo fechado: 100ms → 200ms → 300ms... até abrir ou estourar janela
 //   4. Pre-warm: na inicialização conecta todas as contas ativas antes do primeiro disparo
 //   5. Pool persistente: conexões Telegram vivem entre ciclos (igual à versão anterior)
+//   6. Keepalive: ping leve a cada 45s por conta — evita queda TCP ociosa e reconexões lentas
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient } from "telegram";
@@ -19,7 +20,7 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const SEND_TIMEOUT_MS       = 15_000;
+const SEND_TIMEOUT_MS        = 15_000;
 const INLINE_RETRY_BUDGET_MS = 50_000;
 
 // Fast retry (grupo fechado): 100ms, 200ms, 300ms... cap em 5s
@@ -32,6 +33,9 @@ const RELOAD_INTERVAL_MS = 30_000;
 
 // Janela de lookahead: agenda timers para schedules nos próximos N ms
 const LOOKAHEAD_MS = 2 * 60 * 1000; // 2 minutos
+
+// Keepalive: intervalo entre pings para manter TCP vivo
+const KEEPALIVE_INTERVAL_MS = 45_000; // 45s — bem abaixo do timeout de NAT (~60-120s)
 
 /* ─── Tipos ─── */
 interface Account {
@@ -94,8 +98,28 @@ async function getOrResolvePeer(client: TelegramClient, telegramChatId: string):
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  private clients  = new Map<string, TelegramClient>();
-  private sessions = new Map<string, string>(); // account_id → session_string em uso
+  private clients         = new Map<string, TelegramClient>();
+  private sessions        = new Map<string, string>(); // account_id → session_string em uso
+  private keepaliveTimers = new Map<string, ReturnType<typeof setInterval>>(); // account_id → timer
+
+  /* Inicia (ou reinicia) o keepalive para uma conta.
+     Faz um getMe() leve a cada 45s — suficiente para manter o TCP vivo
+     em qualquer NAT/firewall sem sobrecarregar o servidor.             */
+  private startKeepalive(accountId: string, client: TelegramClient): void {
+    const existing = this.keepaliveTimers.get(accountId);
+    if (existing) clearInterval(existing);
+
+    const interval = setInterval(async () => {
+      if (!client.connected) return;
+      try {
+        await client.getMe();
+      } catch {
+        // silencioso — o próximo get() reconecta se necessário
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+
+    this.keepaliveTimers.set(accountId, interval);
+  }
 
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
@@ -108,6 +132,8 @@ class TelegramClientPool {
     if (existing) {
       try { await existing.disconnect(); } catch {}
       this.clients.delete(account.id);
+      clearInterval(this.keepaliveTimers.get(account.id)); // para o keepalive da conexão antiga
+      this.keepaliveTimers.delete(account.id);
     }
 
     if (sessionChanged && sessionInUse) {
@@ -123,6 +149,7 @@ class TelegramClientPool {
     await client.connect();
     this.clients.set(account.id, client);
     this.sessions.set(account.id, account.session_string);
+    this.startKeepalive(account.id, client); // inicia keepalive para a nova conexão
     console.log(`[pool] Conectado: ${account.phone_number}`);
     return client;
   }
@@ -134,6 +161,10 @@ class TelegramClientPool {
   }
 
   async disconnectAll(): Promise<void> {
+    // Para todos os keepalives antes de desconectar
+    for (const timer of this.keepaliveTimers.values()) clearInterval(timer);
+    this.keepaliveTimers.clear();
+
     await Promise.all(
       [...this.clients.entries()].map(async ([id, client]) => {
         try { await client.disconnect(); } catch {}
@@ -283,7 +314,7 @@ async function sendWithFastRetry(
     } catch (err: unknown) {
       if (Date.now() < windowEnd) {
         // Fast retry linear em qualquer erro: 100ms, 200ms, 300ms...
-        const waitMs  = zigzagStep * FAST_RETRY_BASE_MS;
+        const waitMs   = zigzagStep * FAST_RETRY_BASE_MS;
         const timeLeft = windowEnd - Date.now();
 
         if (timeLeft > waitMs) {
@@ -565,8 +596,8 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
    Garante que novos schedules criados enquanto o worker roda sejam agendados.
    Também garante que retries cross-invocation sejam disparados a tempo.  ─── */
 async function reloadSchedules(): Promise<void> {
-  const now        = new Date();
-  const nowISO     = now.toISOString();
+  const now          = new Date();
+  const nowISO       = now.toISOString();
   const lookaheadISO = new Date(now.getTime() + LOOKAHEAD_MS).toISOString();
 
   const [
@@ -656,6 +687,7 @@ async function prewarmAccounts(): Promise<void> {
 
   if (error) {
     console.warn("[prewarm] Falha ao buscar contas:", error.message);
+    prewarmRunning = false;
     return;
   }
 
@@ -672,7 +704,7 @@ async function prewarmAccounts(): Promise<void> {
 
 /* ─── Inicialização ─── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando — precision timers + peer cache + fast retry");
+  console.log("[worker] Iniciando — precision timers + peer cache + fast retry + keepalive");
 
   // Pre-warm de conexões em paralelo com o primeiro reload
   await Promise.all([
@@ -689,7 +721,7 @@ async function init(): Promise<void> {
     }
   }, RELOAD_INTERVAL_MS);
 
-  console.log("[worker] Pronto. Precision timers ativos.");
+  console.log("[worker] Pronto. Precision timers + keepalive ativos.");
 }
 
 init().catch((err) => {
