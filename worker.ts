@@ -2,6 +2,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
+import bigInt from "big-integer";
 
 /* ─── Supabase ─── */
 const supabase = createClient(
@@ -67,11 +68,10 @@ const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
 
 /* ─── Resolve peer com múltiplos fallbacks ────────────────────────────────
-   Estratégia:
-   1. Cache em memória (instantâneo)
-   2. getInputEntity direto (funciona se a sessão já tem o chat no cache MTProto)
-   3. GetChannels via invoke com accessHash=0 (funciona se a conta é membro)
-   4. GetDialogs para forçar sync do cache MTProto, depois tenta de novo
+   1. Cache em memória
+   2. getInputEntity direto
+   3. GetChannels via MTProto com bigInt (compatível com gramjs)
+   4. getDialogs para forçar sync, depois tenta de novo
    ─────────────────────────────────────────────────────────────────────── */
 async function getOrResolvePeer(
   client: TelegramClient,
@@ -93,20 +93,17 @@ async function getOrResolvePeer(
   }
 
   // Tentativa 2: GetChannels via MTProto direto
-  // Para IDs -100XXXXXXXXXX, o channelId real é abs(id) - 1_000_000_000_000
-  // Mas alguns IDs são menores (grupos antigos): abs(id) sem ajuste
+  // Para IDs -100XXXXXXXXXX, channelId real = abs(id) - 1_000_000_000_000
   const absId     = Math.abs(chatIdNum);
-  const channelId = absId > 1_000_000_000_000
-    ? absId - 1_000_000_000_000
-    : absId;
+  const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
 
   try {
     const result = await client.invoke(
       new Api.channels.GetChannels({
         id: [
           new Api.InputChannel({
-            channelId: BigInt(channelId),
-            accessHash: BigInt(0),
+            channelId: bigInt(channelId),
+            accessHash: bigInt(0),
           }),
         ],
       })
@@ -126,7 +123,7 @@ async function getOrResolvePeer(
     console.warn(`[peer] GetChannels falhou para ${telegramChatId}: ${e2.message}`);
   }
 
-  // Tentativa 3: GetDialogs força o gramjs a sincronizar o cache interno
+  // Tentativa 3: getDialogs força sync do cache MTProto interno
   try {
     console.warn(`[peer] Sincronizando dialogs para resolver ${telegramChatId}...`);
     await client.getDialogs({ limit: 200 });
@@ -213,15 +210,12 @@ class TelegramClientPool {
 
     await client.connect();
 
-    // Descarta updates — só precisamos enviar, não receber eventos em tempo real
-    client.setUpdateCallback(async () => {});
-
     // Warm-up: força sync do cache MTProto para resolver peers depois
     try {
       await client.getDialogs({ limit: 100 });
       console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
     } catch (err: any) {
-      console.warn(`[pool] Aviso: getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
+      console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
     }
 
     this.clients.set(account.id, client);
@@ -267,11 +261,10 @@ const PERMANENT_ERRORS: string[] = [];
 function isRetryableError(msg: string): boolean {
   const upper = msg.toUpperCase();
   if (PERMANENT_ERRORS.some((e) => upper.includes(e))) return false;
-  // Erros que NÃO devem ser retentados
-  if (upper.includes("PEER_UNRESOLVABLE"))  return false;
-  if (upper.includes("AUTH_KEY_UNREGISTERED")) return false;
-  if (upper.includes("USER_DEACTIVATED"))   return false;
-  if (upper.includes("SESSION_REVOKED"))    return false;
+  if (upper.includes("PEER_UNRESOLVABLE"))      return false;
+  if (upper.includes("AUTH_KEY_UNREGISTERED"))  return false;
+  if (upper.includes("USER_DEACTIVATED"))       return false;
+  if (upper.includes("SESSION_REVOKED"))        return false;
   return true;
 }
 
@@ -333,9 +326,7 @@ async function getSucceededAccountIds(schedule: Schedule): Promise<string[]> {
   return (data ?? []).map((r) => r.account_id as string);
 }
 
-/* ─── Envio com fast retry ────────────────────────────────────────────────
-   Retenta a cada 100ms → 200ms → ... (zig-zag até 700ms) dentro de 30s.
-   Limpa o peer cache se receber PEER_ID_INVALID ou CHANNEL_INVALID.     ─── */
+/* ─── Envio com fast retry ─── */
 async function sendWithFastRetry(
   client: TelegramClient,
   account: Account,
@@ -360,7 +351,6 @@ async function sendWithFastRetry(
       } catch (err: any) {
         const errMsg = String(err?.message ?? "");
 
-        // Limpa cache e força re-resolução se peer ficou inválido
         if (
           errMsg.includes("PEER_ID_INVALID") ||
           errMsg.includes("CHANNEL_INVALID") ||
@@ -370,7 +360,6 @@ async function sendWithFastRetry(
           peerCache.delete(telegramChatId);
         }
 
-        // FloodWait — trata inline se couber no timeout
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -401,7 +390,6 @@ async function sendWithFastRetry(
     } catch (err: unknown) {
       const errMsg = (err as any)?.message ?? String(err);
 
-      // Erros permanentes não fazem sentido retentar em fast-retry
       if (errMsg.includes("PEER_UNRESOLVABLE") || errMsg.includes("AUTH_KEY")) {
         throw err;
       }
@@ -579,7 +567,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
-  // Usa accountCache para session_string mais recente sem query extra
   if (group.group_members) {
     group.group_members = group.group_members.map((m) => ({
       ...m,
@@ -597,7 +584,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
   const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
   const totalDelivered    = sentCount + skippedCount;
-  const allSucceeded      = retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
+  const allSucceeded      =
+    retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
 
   if (allSucceeded) {
     let nextRun: string;
@@ -654,8 +642,7 @@ const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
-
-  if (delay < -5_000) return; // já passou há mais de 5s
+  if (delay < -5_000) return;
 
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
