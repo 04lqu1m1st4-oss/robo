@@ -1,4 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
+// v2 — fast retry, deduplication, improved reliability
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -11,10 +12,8 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const SEND_TIMEOUT_MS        = 15_000;
-const INLINE_RETRY_BUDGET_MS = 50_000;
-const FAST_RETRY_BASE_MS     = 100;
-const FAST_RETRY_WINDOW_MS   = 30_000;
+const SEND_TIMEOUT_MS        = 15_000; // timeout por tentativa individual
+const RETRY_BUDGET_MS        = 50_000; // tempo total máximo tentando um membro
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
@@ -67,12 +66,7 @@ interface MemberResult {
 const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
 
-/* ─── Resolve peer com múltiplos fallbacks ────────────────────────────────
-   1. Cache em memória
-   2. getInputEntity direto
-   3. GetChannels via MTProto com bigInt (compatível com gramjs)
-   4. getDialogs para forçar sync, depois tenta de novo
-   ─────────────────────────────────────────────────────────────────────── */
+/* ─── Resolve peer com múltiplos fallbacks ─────────────────────────────── */
 async function getOrResolvePeer(
   client: TelegramClient,
   telegramChatId: string
@@ -93,7 +87,6 @@ async function getOrResolvePeer(
   }
 
   // Tentativa 2: GetChannels via MTProto direto
-  // Para IDs -100XXXXXXXXXX, channelId real = abs(id) - 1_000_000_000_000
   const absId     = Math.abs(chatIdNum);
   const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
 
@@ -145,6 +138,8 @@ class TelegramClientPool {
   private sessions        = new Map<string, string>();
   private keepaliveTimers = new Map<string, ReturnType<typeof setInterval>>();
 
+  private connectingPromises = new Map<string, Promise<TelegramClient>>();
+
   private startKeepalive(accountId: string, client: TelegramClient): void {
     const existing = this.keepaliveTimers.get(accountId);
     if (existing) clearInterval(existing);
@@ -152,9 +147,7 @@ class TelegramClientPool {
     const interval = setInterval(async () => {
       if (!client.connected) {
         console.warn(`[keepalive] ${accountId} desconectado — removendo do pool`);
-        clearInterval(interval);
-        this.keepaliveTimers.delete(accountId);
-        this.clients.delete(accountId);
+        this._evict(accountId, interval);
         return;
       }
       try {
@@ -167,13 +160,17 @@ class TelegramClientPool {
       } catch (err: any) {
         console.warn(`[keepalive] Ping falhou para ${accountId}: ${err.message} — removendo do pool`);
         try { await client.disconnect(); } catch {}
-        clearInterval(interval);
-        this.keepaliveTimers.delete(accountId);
-        this.clients.delete(accountId);
+        this._evict(accountId, interval);
       }
     }, KEEPALIVE_INTERVAL_MS);
 
     this.keepaliveTimers.set(accountId, interval);
+  }
+
+  private _evict(accountId: string, interval?: ReturnType<typeof setInterval>): void {
+    if (interval) clearInterval(interval);
+    this.keepaliveTimers.delete(accountId);
+    this.clients.delete(accountId);
   }
 
   async get(account: Account): Promise<TelegramClient> {
@@ -183,46 +180,55 @@ class TelegramClientPool {
 
     if (existing?.connected && !sessionChanged) return existing;
 
-    if (existing) {
-      try { await existing.disconnect(); } catch {}
-      this.clients.delete(account.id);
-      const t = this.keepaliveTimers.get(account.id);
-      if (t) { clearInterval(t); this.keepaliveTimers.delete(account.id); }
-    }
+    const inflight = this.connectingPromises.get(account.id);
+    if (inflight) return inflight;
 
-    if (sessionChanged && sessionInUse) {
-      console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
-    }
-
-    const client = new TelegramClient(
-      new StringSession(account.session_string),
-      parseInt(account.api_id),
-      account.api_hash,
-      {
-        connectionRetries: 5,
-        retryDelay: 1_000,
-        autoReconnect: true,
-        sequentialUpdates: false, // evita travamento no _updateLoop
-        floodSleepThreshold: 60,  // trata FloodWait < 60s automaticamente
-        requestRetries: 3,
+    const connectPromise = (async () => {
+      if (existing) {
+        try { await existing.disconnect(); } catch {}
+        this._evict(account.id);
       }
-    );
 
-    await client.connect();
+      if (sessionChanged && sessionInUse) {
+        console.log(`[pool] Session mudou para ${account.phone_number} — reconectando...`);
+      }
 
-    // Warm-up: força sync do cache MTProto para resolver peers depois
+      const client = new TelegramClient(
+        new StringSession(account.session_string),
+        parseInt(account.api_id),
+        account.api_hash,
+        {
+          connectionRetries: 5,
+          retryDelay: 1_000,
+          autoReconnect: true,
+          sequentialUpdates: false,
+          floodSleepThreshold: 60,
+          requestRetries: 3,
+        }
+      );
+
+      await client.connect();
+
+      try {
+        await client.getDialogs({ limit: 100 });
+        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
+      } catch (err: any) {
+        console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
+      }
+
+      this.clients.set(account.id, client);
+      this.sessions.set(account.id, account.session_string);
+      this.startKeepalive(account.id, client);
+      console.log(`[pool] Conectado: ${account.phone_number}`);
+      return client;
+    })();
+
+    this.connectingPromises.set(account.id, connectPromise);
     try {
-      await client.getDialogs({ limit: 100 });
-      console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
-    } catch (err: any) {
-      console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
+      return await connectPromise;
+    } finally {
+      this.connectingPromises.delete(account.id);
     }
-
-    this.clients.set(account.id, client);
-    this.sessions.set(account.id, account.session_string);
-    this.startKeepalive(account.id, client);
-    console.log(`[pool] Conectado: ${account.phone_number}`);
-    return client;
   }
 
   async prewarm(accounts: Account[]): Promise<void> {
@@ -256,12 +262,8 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT",  shutdown);
 
 /* ─── Helpers ─── */
-const PERMANENT_ERRORS: string[] = [];
-
 function isRetryableError(msg: string): boolean {
   const upper = msg.toUpperCase();
-  if (PERMANENT_ERRORS.some((e) => upper.includes(e))) return false;
-  if (upper.includes("PEER_UNRESOLVABLE"))      return false;
   if (upper.includes("AUTH_KEY_UNREGISTERED"))  return false;
   if (upper.includes("USER_DEACTIVATED"))       return false;
   if (upper.includes("SESSION_REVOKED"))        return false;
@@ -308,130 +310,143 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
-async function getSucceededAccountIds(schedule: Schedule): Promise<string[]> {
-  if (!schedule.retry_until) return [];
-  const retryStartedAt = new Date(
-    new Date(schedule.retry_until).getTime() - schedule.retry_window_seconds * 1000
-  ).toISOString();
+/* ─── DEDUPLICAÇÃO ─── */
+async function getAlreadySentAccountIds(schedule: Schedule): Promise<Set<string>> {
+  const cycleStart = schedule.retry_until
+    ? new Date(
+        new Date(schedule.retry_until).getTime() - schedule.retry_window_seconds * 1000
+      ).toISOString()
+    : schedule.next_run_at;
+
   const { data, error } = await supabase
     .from("dispatch_logs")
     .select("account_id")
     .eq("schedule_id", schedule.id)
     .eq("status", "sent")
-    .gte("sent_at", retryStartedAt);
+    .gte("sent_at", cycleStart);
+
   if (error) {
-    console.warn(`[worker] Falha ao buscar enviados do schedule ${schedule.id}:`, error.message);
-    return [];
+    console.warn(`[dedup] Falha ao buscar enviados do schedule ${schedule.id}:`, error.message);
+    return new Set();
   }
-  return (data ?? []).map((r) => r.account_id as string);
+
+  return new Set((data ?? []).map((r) => r.account_id as string));
 }
 
-/* ─── Envio com fast retry ─── */
-async function sendWithFastRetry(
+/* ─── Envio agressivo: bate sem parar até conseguir ou passar RETRY_BUDGET_MS ─
+   Sem backoff, sem espera entre tentativas — só o tempo da própria chamada.
+   Cada tentativa tem SEND_TIMEOUT_MS para completar.
+   Desiste apenas se:
+     - Passou RETRY_BUDGET_MS no total
+     - FloodWait que excede o budget restante
+   ─────────────────────────────────────────────────────────────────────── */
+async function sendAggressively(
   client: TelegramClient,
   account: Account,
   telegramChatId: string,
   messageText: string
 ): Promise<void> {
-  const windowEnd = Date.now() + FAST_RETRY_WINDOW_MS;
+  const budgetEnd = Date.now() + RETRY_BUDGET_MS;
   let attempt     = 0;
-  let zigzagDir   = 1;
-  let zigzagStep  = 1;
 
-  while (true) {
-    const timeout = new Promise<never>((_, r) =>
-      setTimeout(() => r(new Error("TIMEOUT: send excedeu 15s")), SEND_TIMEOUT_MS)
-    );
+  while (Date.now() < budgetEnd) {
+    attempt++;
+    const timeLeft = budgetEnd - Date.now();
 
-    const trySend = (async () => {
-      const peer = await getOrResolvePeer(client, telegramChatId);
+    if (timeLeft < 500) break;
 
-      try {
-        await client.sendMessage(peer as any, { message: messageText });
-      } catch (err: any) {
-        const errMsg = String(err?.message ?? "");
-
-        if (
-          errMsg.includes("PEER_ID_INVALID") ||
-          errMsg.includes("CHANNEL_INVALID") ||
-          errMsg.includes("CHANNEL_PRIVATE")
-        ) {
-          console.warn(`[peer] Cache inválido para ${telegramChatId} — limpando`);
-          peerCache.delete(telegramChatId);
-        }
-
-        const isFlood =
-          err?.seconds != null ||
-          err?.constructor?.name === "FloodWaitError" ||
-          /flood/i.test(errMsg);
-
-        if (isFlood) {
-          const waitSecs: number = err.seconds ?? parseInt(String(err.message ?? err), 10) ?? 30;
-          console.warn(`[pool] FloodWait ${waitSecs}s — ${account.phone_number}`);
-          if (waitSecs * 1000 < SEND_TIMEOUT_MS - 2_000) {
-            await new Promise((r) => setTimeout(r, waitSecs * 1000));
-            const freshPeer = await getOrResolvePeer(client, telegramChatId);
-            await client.sendMessage(freshPeer as any, { message: messageText });
-            return;
-          }
-          throw new Error(`FLOOD_WAIT_${waitSecs}`);
-        }
-
-        throw err;
-      }
-    })();
+    const attemptTimeout = Math.min(SEND_TIMEOUT_MS, timeLeft - 100);
 
     try {
-      await Promise.race([trySend, timeout]);
-      if (attempt > 0) {
-        console.log(`[fast-retry] ✓ Enviado na tentativa ${attempt + 1} (${account.phone_number})`);
+      await Promise.race([
+        (async () => {
+          const peer = await getOrResolvePeer(client, telegramChatId);
+          try {
+            await client.sendMessage(peer as any, { message: messageText });
+          } catch (err: any) {
+            const errMsg = String(err?.message ?? "");
+
+            if (
+              errMsg.includes("PEER_ID_INVALID") ||
+              errMsg.includes("CHANNEL_INVALID") ||
+              errMsg.includes("CHANNEL_PRIVATE")
+            ) {
+              console.warn(`[peer] Cache inválido para ${telegramChatId} — limpando`);
+              peerCache.delete(telegramChatId);
+            }
+
+            const isFlood =
+              err?.seconds != null ||
+              err?.constructor?.name === "FloodWaitError" ||
+              /flood/i.test(errMsg);
+
+            if (isFlood) {
+              const waitSecs: number =
+                typeof err.seconds === "number"
+                  ? err.seconds
+                  : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "30", 10);
+              const waitMs = waitSecs * 1000;
+              console.warn(`[retry] FloodWait ${waitSecs}s — ${account.phone_number}`);
+
+              if (waitMs < budgetEnd - Date.now() - 500) {
+                await new Promise((r) => setTimeout(r, waitMs));
+                const freshPeer = await getOrResolvePeer(client, telegramChatId);
+                await client.sendMessage(freshPeer as any, { message: messageText });
+                return;
+              }
+              throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
+            }
+
+            throw err;
+          }
+        })(),
+        new Promise<never>((_, r) =>
+          setTimeout(() => r(new Error(`TIMEOUT tentativa ${attempt}`)), attemptTimeout)
+        ),
+      ]);
+
+      if (attempt > 1) {
+        console.log(`[retry] ✓ ${account.phone_number} — enviou na tentativa ${attempt} (${RETRY_BUDGET_MS - (budgetEnd - Date.now())}ms gastos)`);
       }
       return;
+
     } catch (err: unknown) {
       const errMsg = (err as any)?.message ?? String(err);
 
-      if (errMsg.includes("PEER_UNRESOLVABLE") || errMsg.includes("AUTH_KEY")) {
-        throw err;
+      // ── Tenta de novo independente do erro ──
+      const remaining = budgetEnd - Date.now();
+      if (remaining > 500) {
+        console.warn(`[retry] tentativa ${attempt} falhou (${Math.round(remaining / 1000)}s restantes): ${errMsg}`);
+        // Sem sleep — próxima tentativa imediata
       }
-
-      if (Date.now() < windowEnd) {
-        const waitMs   = zigzagStep * FAST_RETRY_BASE_MS;
-        const timeLeft = windowEnd - Date.now();
-
-        if (timeLeft > waitMs) {
-          console.log(
-            `[fast-retry] Falha tentativa ${attempt + 1} — aguardando ${waitMs}ms ` +
-            `(${Math.round(timeLeft / 1000)}s restantes): ${errMsg}`
-          );
-          await new Promise((r) => setTimeout(r, waitMs));
-          attempt++;
-          zigzagStep += zigzagDir;
-          if (zigzagStep >= 7) zigzagDir = -1;
-          if (zigzagStep <= 1) zigzagDir =  1;
-          continue;
-        }
-      }
-
-      throw err;
     }
   }
+
+  throw new Error(`BUDGET_EXCEEDED após ${attempt} tentativa(s) em ${RETRY_BUDGET_MS / 1000}s`);
 }
 
-/* ─── Tenta enviar um membro ─── */
+/* ─── Tenta enviar um membro com deduplicação ─── */
 async function trySendMember(
   member: GroupMember,
   account: Account,
   group: Group,
-  schedule: Schedule
+  schedule: Schedule,
+  alreadySent: Set<string>
 ): Promise<MemberResult> {
+  if (alreadySent.has(account.id)) {
+    console.log(`[worker] ↷ ${member.id} (${account.phone_number}) — já enviou neste ciclo [mem]`);
+    return { member_id: member.id, account_id: account.id, status: "skipped", retryable: false };
+  }
+
   let logStatus: "sent" | "failed" = "failed";
   let errorMsg: string | undefined;
   let retryable = false;
 
   try {
     const client = await clientPool.get(account);
-    await sendWithFastRetry(client, account, group.telegram_chat_id!, member.message_text ?? "");
+    await sendAggressively(client, account, group.telegram_chat_id!, member.message_text ?? "");
     logStatus = "sent";
+    alreadySent.add(account.id);
     console.log(`[worker] ✓ ${member.id} (${account.phone_number})`);
   } catch (err) {
     errorMsg  = err instanceof Error ? err.message : String(err);
@@ -456,83 +471,22 @@ async function trySendMember(
   return { member_id: member.id, account_id: account.id, status: logStatus, retryable, error: errorMsg };
 }
 
-/* ─── Processa membros com retry inline ─── */
+/* ─── Processa membros em paralelo ─── */
 async function processMembersOf(
   schedule: Schedule,
-  skipAccountIds: string[] = []
+  alreadySent: Set<string>
 ): Promise<MemberResult[]> {
-  const group     = schedule.groups;
-  const budgetEnd = Date.now() + INLINE_RETRY_BUDGET_MS;
-  const windowEnd = Date.now() + schedule.retry_window_seconds * 1000;
-  const inlineEnd = Math.min(budgetEnd, windowEnd);
+  const group = schedule.groups;
 
   const members = (group.group_members ?? [])
     .filter((m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
     .sort((a, b) => a.position - b.position);
 
-  const finalResults = new Map<string, MemberResult>();
-  const toProcess: GroupMember[] = [];
+  const results = await Promise.all(
+    members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
+  );
 
-  for (const member of members) {
-    const account = member.accounts!;
-    if (skipAccountIds.includes(account.id)) {
-      console.log(`[worker] ↷ ${member.id} pulado — já enviou neste ciclo`);
-      finalResults.set(member.id, {
-        member_id: member.id, account_id: account.id,
-        status: "skipped", retryable: false,
-      });
-    } else {
-      toProcess.push(member);
-    }
-  }
-
-  let pending       = [...toProcess];
-  let inlineAttempt = 0;
-
-  while (pending.length > 0) {
-    if (inlineAttempt > 0) {
-      const waitMs   = Math.min(
-        schedule.retry_interval_seconds * Math.pow(2, inlineAttempt - 1) * 1000,
-        schedule.retry_interval_max_seconds * 1000
-      );
-      const timeLeft = inlineEnd - Date.now();
-      if (timeLeft <= waitMs + SEND_TIMEOUT_MS) {
-        console.log(`[worker] ⏱ Budget inline esgotado. ${pending.length} → cross-invocation.`);
-        break;
-      }
-      console.log(`[worker] ↻ Retry inline #${inlineAttempt} em ${waitMs}ms...`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-
-    inlineAttempt++;
-
-    const settled = await Promise.allSettled(
-      pending.map((m) => trySendMember(m, m.accounts!, group, schedule))
-    );
-
-    const stillPending: GroupMember[] = [];
-    settled.forEach((outcome, i) => {
-      const member = pending[i];
-      if (outcome.status === "fulfilled") {
-        finalResults.set(member.id, outcome.value);
-        if (outcome.value.status === "failed" && outcome.value.retryable) {
-          stillPending.push(member);
-        }
-      } else {
-        const errorMsg = String(outcome.reason);
-        finalResults.set(member.id, {
-          member_id: member.id, account_id: member.accounts!.id,
-          status: "failed", retryable: true, error: errorMsg,
-        });
-        stillPending.push(member);
-      }
-    });
-
-    pending = stillPending;
-    if (Date.now() >= inlineEnd) break;
-  }
-
-  return Array.from(finalResults.values());
+  return results;
 }
 
 /* ─── Dispara um schedule ─── */
@@ -576,16 +530,27 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
   console.log(`[timer] ⚡ Disparando schedule ${scheduleId} às ${nowISO}`);
 
-  const succeededIds = await getSucceededAccountIds(schedule);
-  const results      = await processMembersOf(schedule, succeededIds);
+  const alreadySent = await getAlreadySentAccountIds(schedule);
+  if (alreadySent.size > 0) {
+    console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — serão pulados.`);
+  }
+
+  const results = await processMembersOf(schedule, alreadySent);
 
   const sentCount         = results.filter((r) => r.status === "sent").length;
   const skippedCount      = results.filter((r) => r.status === "skipped").length;
   const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
   const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
   const totalDelivered    = sentCount + skippedCount;
+
+  const hasActiveMembers  = (group.group_members ?? []).some(
+    (m) => m.is_active && m.accounts?.is_active
+  );
   const allSucceeded      =
-    retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
+    hasActiveMembers &&
+    retryableFailures.length === 0 &&
+    permanentFailures.length === 0 &&
+    totalDelivered > 0;
 
   if (allSucceeded) {
     let nextRun: string;
@@ -598,9 +563,13 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }
 
     await supabase.from("schedules").update({
-      next_run_at: nextRun, last_run_at: nowISO,
-      retry_until: null, retry_count: 0,
-      last_attempt_at: nowISO, last_attempt_status: "sent", last_attempt_error: null,
+      next_run_at:          nextRun,
+      last_run_at:          nowISO,
+      retry_until:          null,
+      retry_count:          0,
+      last_attempt_at:      nowISO,
+      last_attempt_status:  "sent",
+      last_attempt_error:   null,
     }).eq("id", scheduleId);
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
@@ -615,13 +584,15 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     const failedErrors = results
       .filter((r) => r.status === "failed" && r.error)
-      .map((r) => r.error)
+      .map((r) => `[${r.account_id}] ${r.error}`)
       .join("; ");
 
     await supabase.from("schedules").update({
-      retry_until: retryUntil, retry_count: newRetryCount,
-      last_attempt_at: nowISO, last_attempt_status: "retrying",
-      last_attempt_error: failedErrors || null,
+      retry_until:         retryUntil,
+      retry_count:         newRetryCount,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "retrying",
+      last_attempt_error:  failedErrors || null,
     }).eq("id", scheduleId);
 
     const intervalNext = calcRetryInterval(
@@ -631,9 +602,15 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     );
 
     console.warn(
-      `[timer] ⚠ Schedule ${scheduleId}: ${retryableFailures.length} falha(s), ` +
-      `retry #${newRetryCount} em ~${intervalNext}s (até ${retryUntil})`
+      `[timer] ⚠ Schedule ${scheduleId}: ${retryableFailures.length} falha(s) retryável(eis), ` +
+      `${permanentFailures.length} permanente(s). ` +
+      `Retry #${newRetryCount} em ~${intervalNext}s (até ${retryUntil})`
     );
+
+    const retryAt = new Date(now.getTime() + intervalNext * 1000);
+    if (retryAt < new Date(retryUntil)) {
+      scheduleTimer(scheduleId, retryAt.toISOString());
+    }
   }
 }
 
@@ -642,7 +619,11 @@ const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
-  if (delay < -5_000) return;
+
+  if (delay < -5_000) {
+    console.warn(`[timer] Schedule ${scheduleId} ignorado — next_run_at muito no passado (${nextRunAt})`);
+    return;
+  }
 
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
@@ -706,7 +687,7 @@ async function reloadSchedules(): Promise<void> {
 
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
-      console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando.`);
+      console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando para próxima semana.`);
       let nextRun: string;
       try {
         nextRun = nextWeeklyOccurrence(expired.cron_expression);
@@ -715,17 +696,22 @@ async function reloadSchedules(): Promise<void> {
         return;
       }
       await supabase.from("schedules").update({
-        next_run_at: nextRun, last_run_at: nowISO,
-        retry_until: null, retry_count: 0,
-        last_attempt_at: nowISO, last_attempt_status: "failed",
-        last_attempt_error: "Retry expirou sem sucesso total",
+        next_run_at:         nextRun,
+        last_run_at:         nowISO,
+        retry_until:         null,
+        retry_count:         0,
+        last_attempt_at:     nowISO,
+        last_attempt_status: "failed",
+        last_attempt_error:  "Retry expirou sem sucesso total",
       }).eq("id", expired.id);
       scheduleTimer(expired.id, nextRun);
     })
   );
 
   for (const s of futureSchedules ?? []) {
-    scheduleTimer(s.id, s.next_run_at);
+    if (!scheduledTimers.has(s.id)) {
+      scheduleTimer(s.id, s.next_run_at);
+    }
   }
 
   for (const s of retrySchedules ?? []) {
@@ -766,12 +752,12 @@ async function prewarmAccounts(): Promise<void> {
 /* ─── Inicialização ─── */
 async function init(): Promise<void> {
   console.log("[worker] Iniciando...");
-
-  await Promise.all([prewarmAccounts(), reloadSchedules()]);
+  await prewarmAccounts();
+  await reloadSchedules();
 
   setInterval(async () => {
     try {
-      await Promise.all([reloadSchedules(), prewarmAccounts()]);
+      await Promise.allSettled([reloadSchedules(), prewarmAccounts()]);
     } catch (err) {
       console.error("[reload] Erro no reload periódico:", err);
     }
