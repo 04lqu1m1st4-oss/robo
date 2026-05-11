@@ -570,7 +570,10 @@ async function monitorPositions(
       }
 
       // Atribui posições
-      const updates: Promise<any>[] = [];
+      // FIX: use Promise<unknown>[] and wrap each Supabase builder in Promise.resolve()
+      // so TypeScript sees a proper Promise (PostgrestFilterBuilder is a thenable but
+      // lacks .catch / .finally, causing TS2345 when typed as Promise<any>[]).
+      const updates: Promise<unknown>[] = [];
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
 
       for (const sm of sentMembers) {
@@ -583,12 +586,14 @@ async function monitorPositions(
         console.log(`[monitor] ${sm.account_id}: #${rank} em ${telegramChatId}`);
 
         updates.push(
-          supabase.from("dispatch_logs")
-            .update({ position_rank: rank })
-            .eq("schedule_id", scheduleId)
-            .eq("account_id",  sm.account_id)
-            .eq("status",      "sent")
-            .gte("sent_at",    cutoff)
+          Promise.resolve(
+            supabase.from("dispatch_logs")
+              .update({ position_rank: rank })
+              .eq("schedule_id", scheduleId)
+              .eq("account_id",  sm.account_id)
+              .eq("status",      "sent")
+              .gte("sent_at",    cutoff)
+          )
         );
       }
 
