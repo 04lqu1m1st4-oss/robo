@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
 import bigInt from "big-integer";
+import http from "http";
 
 /* ─── Supabase ─── */
 const supabase = createClient(
@@ -19,10 +20,10 @@ const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
 
 // Monitoramento de posição
-const MONITOR_DELAY_CLOSED_MS = 6_000;    // aguarda mensagens propagarem (grupos fechados)
-const MONITOR_MAX_OPEN_MS     = 5 * 60_000; // polling por até 5 min (grupos abertos)
-const MONITOR_POLL_MS         = 5_000;    // intervalo entre tentativas (grupos abertos)
-const MONITOR_HISTORY_LIMIT   = 150;      // mensagens buscadas por chamada
+const MONITOR_DELAY_CLOSED_MS = 6_000;
+const MONITOR_MAX_OPEN_MS     = 5 * 60_000;
+const MONITOR_POLL_MS         = 5_000;
+const MONITOR_HISTORY_LIMIT   = 150;
 
 /* ─── Tipos ─── */
 interface Account {
@@ -83,7 +84,6 @@ async function getOrResolvePeer(
   const chatIdNum = parseInt(telegramChatId, 10);
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
-  // Tentativa 1: getInputEntity direto (funciona se dialogs já foram sincronizados)
   try {
     const peer = await client.getInputEntity(chatIdNum);
     peerCache.set(telegramChatId, peer);
@@ -93,7 +93,6 @@ async function getOrResolvePeer(
     console.warn(`[peer] getInputEntity falhou para ${telegramChatId}: ${e1.message}`);
   }
 
-  // Tentativa 2: channels.GetChannels via MTProto (funciona para supergrupos/canais)
   const absId     = Math.abs(chatIdNum);
   const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
 
@@ -123,7 +122,6 @@ async function getOrResolvePeer(
     console.warn(`[peer] GetChannels falhou para ${telegramChatId}: ${e2.message}`);
   }
 
-  // Tentativa 3: sincroniza dialogs e tenta de novo
   try {
     console.warn(`[peer] Sincronizando dialogs para resolver ${telegramChatId}...`);
     await client.getDialogs({ limit: 200 });
@@ -168,7 +166,6 @@ class TelegramClientPool {
         try { await client.disconnect(); } catch {}
         this._evict(accountId, interval);
 
-        // Sessão morta: desativa no banco pra não reentrar no prewarm
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
           err.message?.includes("USER_DEACTIVATED") ||
@@ -226,13 +223,10 @@ class TelegramClientPool {
         }
       );
 
-      // Desliga o _updateLoop antes de conectar — worker só envia, não precisa receber updates.
-      // receiveUpdates: false não existe no tipo; monkey-patch é o jeito correto.
       (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
-      // Warm-up: sincroniza dialogs para getInputEntity funcionar
       try {
         await client.getDialogs({ limit: 100 });
         console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
@@ -279,6 +273,7 @@ const clientPool = new TelegramClientPool();
 /* ─── Graceful shutdown ─── */
 async function shutdown() {
   console.log("[worker] Encerrando...");
+  httpServer.close();
   await clientPool.disconnectAll();
   process.exit(0);
 }
@@ -504,20 +499,13 @@ async function processMembersOf(
   return results;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
-   AGUARDA SINAL DO ADMIN (grupos abertos)
-   Fica em polling até detectar:
-     - Texto "ok" (qualquer capitalização)
-     - Qualquer mídia / foto
-   Retorna true se detectou, false se estourou o timeout.
-   ─────────────────────────────────────────────────────────────────────── */
 async function waitForAdminSignal(
   client: TelegramClient,
   telegramChatId: string,
-  timeoutMs: number = 30 * 60_000   // espera até 30 min por padrão
+  timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
   const deadline      = Date.now() + timeoutMs;
-  const startUnix     = Math.floor((Date.now() - 5_000) / 1000); // janela com 5s de folga
+  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -562,17 +550,6 @@ async function waitForAdminSignal(
   return false;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
-   MONITORAMENTO DE POSIÇÃO — fire-and-forget, zero impacto no disparo
-
-   Lógica:
-   - Grupos fechados: espera MONITOR_DELAY_CLOSED_MS, busca histórico uma vez
-   - Grupos abertos:  polling até mensagens aparecerem (pós-aprovação do admin)
-                      ou até MONITOR_MAX_OPEN_MS expirar
-
-   Posição = rank cronológico entre TODAS as mensagens visíveis na janela de
-   tempo que começa 15s antes do disparo. Posição 1 = primeira mensagem.
-   ─────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
   sentMembers: Array<{ account_id: string; message_text: string }>,
@@ -623,10 +600,9 @@ async function monitorPositions(
 
       const allMsgs: any[] = result.messages ?? [];
 
-      // Filtra janela de tempo e ordena cronologicamente (GetHistory = mais recente primeiro)
       const windowMsgs = allMsgs
         .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-        .reverse(); // [0] = mais antigo = posição 1
+        .reverse();
 
       if (windowMsgs.length === 0) {
         if (groupType === "closed") {
@@ -640,8 +616,6 @@ async function monitorPositions(
       const ourMessagesVisible = windowMsgs.some((m: any) => ourTexts.has(m.message));
 
       if (groupType === "open" && !ourMessagesVisible) {
-        // Para grupos abertos o envio já ocorreu após o ok do admin.
-        // Se as mensagens ainda não estão visíveis, aguarda mais um pouco.
         await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
@@ -724,7 +698,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
   console.log(`[timer] ⚡ Disparando schedule ${scheduleId} às ${nowISO}`);
 
-  // Grupos abertos: só envia após o ok do admin
   if (group.group_type === "open") {
     const firstAccount = (group.group_members ?? [])
       .find((m) => m.is_active && m.accounts?.is_active)?.accounts;
@@ -746,10 +719,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — serão pulados.`);
   }
 
-  // ── DISPARO ──
   const results = await processMembersOf(schedule, alreadySent);
 
-  // ── MONITORAMENTO DE POSIÇÃO (fire-and-forget) ──
   const sentForMonitor = results
     .filter((r) => r.status === "sent")
     .map((r) => {
@@ -768,7 +739,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     ).catch((err) => console.error("[monitor] Erro não capturado:", err.message));
   }
 
-  // ── ATUALIZAÇÃO DO SCHEDULE ──
   const sentCount         = results.filter((r) => r.status === "sent").length;
   const skippedCount      = results.filter((r) => r.status === "skipped").length;
   const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
@@ -976,7 +946,6 @@ async function prewarmAccounts(): Promise<void> {
     const accounts = (data ?? []) as Account[];
     for (const account of accounts) accountCache.set(account.id, account);
 
-    // Prewarm paralelo — se falhar com sessão morta, desativa no banco
     await Promise.allSettled(
       accounts.map(async (account) => {
         try {
@@ -997,6 +966,155 @@ async function prewarmAccounts(): Promise<void> {
     prewarmRunning = false;
   }
 }
+
+/* ─── HTTP server interno ────────────────────────────────────────────────────
+   Expõe endpoints para que o Next.js busque dados usando a conexão
+   já estabelecida pelo worker, evitando AUTH_KEY_DUPLICATED.
+
+   Rotas:
+     GET /accounts/:id/chats
+     GET /accounts/:id/chat-members?chat_id=XXXX
+
+   Protegido por WORKER_SECRET (header x-worker-secret).
+   ─────────────────────────────────────────────────────────────────────────── */
+const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
+const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
+
+function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(payload);
+}
+
+const httpServer = http.createServer(async (req, res) => {
+  // Autenticação
+  if (WORKER_SECRET && req.headers["x-worker-secret"] !== WORKER_SECRET) {
+    return jsonResponse(res, 401, { error: "Unauthorized" });
+  }
+
+  const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
+
+  // GET /accounts/:id/chats
+  const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
+  if (req.method === "GET" && chatsMatch) {
+    const accountId = chatsMatch[1];
+    const account   = accountCache.get(accountId);
+
+    if (!account) {
+      return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    }
+
+    try {
+      const client  = await clientPool.get(account);
+      const dialogs = await client.getDialogs({ limit: 200 });
+      const chats   = dialogs
+        .filter((d) => d.isGroup || d.isChannel)
+        .map((d) => ({
+          id:          String(d.id),
+          name:        d.title ?? d.name ?? "Sem nome",
+          type:        d.isChannel ? "channel" : "group",
+          accessHash:  null,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      return jsonResponse(res, 200, chats);
+    } catch (err: any) {
+      console.error("[http] /chats erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // GET /accounts/:id/chat-members?chat_id=XXXX
+  const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
+  if (req.method === "GET" && membersMatch) {
+    const accountId = membersMatch[1];
+    const chatId    = url.searchParams.get("chat_id");
+    const account   = accountCache.get(accountId);
+
+    if (!chatId)    return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account)   return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+
+    type MemberOut = { id: string; name: string | null; username: string | null; phone: string | null };
+
+    try {
+      const client    = await clientPool.get(account);
+      const rawId     = chatId.replace(/^-/, "");
+      const isSupergroup = chatId.startsWith("-100");
+      let members: MemberOut[] = [];
+
+      if (isSupergroup) {
+        try {
+          const dialogs = await client.getDialogs({ limit: 500 });
+          const dialog  = dialogs.find((d) => {
+            const dId = String(d.id);
+            return dId === rawId || dId === chatId || dId === rawId.replace(/^100/, "");
+          });
+          const entity = dialog?.entity;
+          if (entity && (entity.className === "Channel" || entity.className === "Chat")) {
+            const result = await client.invoke(
+              new Api.channels.GetParticipants({
+                channel: entity as Api.Channel,
+                filter:  new Api.ChannelParticipantsRecent(),
+                offset:  0,
+                limit:   200,
+                hash:    bigInt(0),
+              })
+            );
+            if (result.className === "channels.ChannelParticipants") {
+              members = result.users
+                .filter((u): u is Api.User => u.className === "User" && !u.bot)
+                .map((u) => ({
+                  id:       String(u.id),
+                  name:     [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
+                  username: u.username ? `@${u.username}` : null,
+                  phone:    u.phone ? `+${u.phone}` : null,
+                }));
+            }
+          }
+        } catch { /* tenta estratégia 2 */ }
+      }
+
+      if (members.length === 0) {
+        try {
+          const numericId = bigInt(rawId);
+          const full      = await client.invoke(new Api.messages.GetFullChat({ chatId: numericId }));
+          const chatFull  = full.fullChat as Api.ChatFull;
+          const parts     = chatFull.participants;
+          if (parts && parts.className === "ChatParticipants") {
+            const userMap = new Map<string, Api.User>();
+            for (const u of full.users) {
+              if (u.className === "User") userMap.set(String(u.id), u as Api.User);
+            }
+            members = parts.participants
+              .map((p) => {
+                const u = userMap.get(String((p as any).userId));
+                if (!u || u.bot) return null;
+                return {
+                  id:       String(u.id),
+                  name:     [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
+                  username: u.username ? `@${u.username}` : null,
+                  phone:    u.phone ? `+${u.phone}` : null,
+                };
+              })
+              .filter((m): m is MemberOut => m !== null);
+          }
+        } catch { /* silencia */ }
+      }
+
+      members.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
+      return jsonResponse(res, 200, members);
+    } catch (err: any) {
+      console.error("[http] /chat-members erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  jsonResponse(res, 404, { error: "Not found" });
+});
+
+httpServer.listen(WORKER_PORT, () => {
+  console.log(`[worker] HTTP interno escutando na porta ${WORKER_PORT}`);
+});
 
 /* ─── Inicialização ─── */
 async function init(): Promise<void> {
