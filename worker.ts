@@ -579,11 +579,74 @@ async function monitorPositions(
         continue;
       }
 
-      const anyFound = windowMsgs.some((m: any) => ourTexts.has(m.message));
+      const ourMessagesVisible = windowMsgs.some((m: any) => ourTexts.has(m.message));
 
-      if (!anyFound && groupType === "open") {
-        await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
-        continue;
+      if (groupType === "open" && !ourMessagesVisible) {
+        // Aguarda sinal do admin: texto "ok" (qualquer case) ou qualquer mídia/foto
+        const adminSignal = windowMsgs.some((m: any) => {
+          const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
+          const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+          return isOk || isMedia;
+        });
+
+        if (!adminSignal) {
+          await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
+          continue;
+        }
+
+        // Sinal detectado — aguarda 3s para mensagens propagarem e busca de novo
+        console.log(`[monitor] ✓ Sinal do admin detectado em ${telegramChatId} — aguardando propagação...`);
+        await new Promise((r) => setTimeout(r, 3_000));
+
+        // Re-busca histórico atualizado
+        try {
+          const freshResult = await client.invoke(
+            new Api.messages.GetHistory({
+              peer:       peer as any,
+              limit:      MONITOR_HISTORY_LIMIT,
+              offsetDate: 0,
+              offsetId:   0,
+              maxId:      0,
+              minId:      0,
+              hash:       bigInt(0),
+              addOffset:  0,
+            })
+          ) as any;
+
+          const freshMsgs = (freshResult.messages ?? [])
+            .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
+            .reverse();
+
+          const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
+          const updates: Promise<unknown>[] = [];
+
+          for (const sm of sentMembers) {
+            if (!sm.message_text) continue;
+            const idx = freshMsgs.findIndex((m: any) => m.message === sm.message_text);
+            if (idx < 0) {
+              console.warn(`[monitor] Mensagem de ${sm.account_id} ainda não visível após sinal do admin`);
+              continue;
+            }
+            const rank = idx + 1;
+            console.log(`[monitor] ${sm.account_id}: #${rank} em ${telegramChatId} (pós-aprovação)`);
+            updates.push(
+              Promise.resolve(
+                supabase.from("dispatch_logs")
+                  .update({ position_rank: rank })
+                  .eq("schedule_id", scheduleId)
+                  .eq("account_id",  sm.account_id)
+                  .eq("status",      "sent")
+                  .gte("sent_at",    cutoff)
+              )
+            );
+          }
+
+          await Promise.allSettled(updates);
+          console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId} (pós-aprovação)`);
+        } catch (freshErr: any) {
+          console.warn(`[monitor] Erro ao re-buscar histórico pós-sinal: ${freshErr.message}`);
+        }
+        return;
       }
 
       const updates: Promise<unknown>[] = [];
