@@ -167,6 +167,20 @@ class TelegramClientPool {
         console.warn(`[keepalive] Ping falhou para ${accountId}: ${err.message} — removendo do pool`);
         try { await client.disconnect(); } catch {}
         this._evict(accountId, interval);
+
+        // Sessão morta: desativa no banco pra não reentrar no prewarm
+        const authDead =
+          err.message?.includes("AUTH_KEY_UNREGISTERED") ||
+          err.message?.includes("USER_DEACTIVATED") ||
+          err.message?.includes("SESSION_REVOKED");
+        if (authDead) {
+          console.warn(`[keepalive] Sessão morta para ${accountId} — desativando no banco.`);
+          supabase.from("accounts").update({ is_active: false }).eq("id", accountId)
+            .then(({ error }) => {
+              if (error) console.error(`[keepalive] Falha ao desativar conta ${accountId}:`, error.message);
+              else console.log(`[keepalive] Conta ${accountId} desativada.`);
+            });
+        }
       }
     }, KEEPALIVE_INTERVAL_MS);
 
@@ -884,7 +898,24 @@ async function prewarmAccounts(): Promise<void> {
 
     const accounts = (data ?? []) as Account[];
     for (const account of accounts) accountCache.set(account.id, account);
-    await clientPool.prewarm(accounts);
+
+    // Prewarm paralelo — se falhar com sessão morta, desativa no banco
+    await Promise.allSettled(
+      accounts.map(async (account) => {
+        try {
+          await clientPool.get(account);
+        } catch (err: any) {
+          const authDead =
+            err.message?.includes("AUTH_KEY_UNREGISTERED") ||
+            err.message?.includes("USER_DEACTIVATED") ||
+            err.message?.includes("SESSION_REVOKED");
+          if (authDead) {
+            console.warn(`[prewarm] Sessão morta para ${account.phone_number} — desativando no banco.`);
+            await supabase.from("accounts").update({ is_active: false }).eq("id", account.id);
+          }
+        }
+      })
+    );
   } finally {
     prewarmRunning = false;
   }
