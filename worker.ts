@@ -207,11 +207,14 @@ class TelegramClientPool {
           connectionRetries: 5,
           retryDelay: 1_000,
           autoReconnect: true,
-          receiveUpdates: false,
           floodSleepThreshold: 60,
           requestRetries: 3,
-        } as any
+        }
       );
+
+      // Desliga o _updateLoop antes de conectar — worker só envia, não precisa receber updates.
+      // receiveUpdates: false não existe no tipo; monkey-patch é o jeito correto.
+      (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
