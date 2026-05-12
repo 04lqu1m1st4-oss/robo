@@ -203,11 +203,13 @@ class TelegramClientPool {
         new StringSession(account.session_string),
         parseInt(account.api_id),
         account.api_hash,
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore — receiveUpdates existe em runtime mas falta nos tipos do gramjs
         {
           connectionRetries: 5,
           retryDelay: 1_000,
           autoReconnect: true,
-          receiveUpdates: false,  // ← FIX: desliga o _updateLoop (causava TIMEOUT spam)
+          receiveUpdates: false,
           floodSleepThreshold: 60,
           requestRetries: 3,
         }
