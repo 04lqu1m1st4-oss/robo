@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v3 — position monitoring added (fire-and-forget)
+// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -19,10 +19,10 @@ const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
 
 // Monitoramento de posição
-const MONITOR_DELAY_CLOSED_MS = 6_000;   // aguarda mensagens propagarem (grupos fechados)
+const MONITOR_DELAY_CLOSED_MS = 6_000;    // aguarda mensagens propagarem (grupos fechados)
 const MONITOR_MAX_OPEN_MS     = 5 * 60_000; // polling por até 5 min (grupos abertos)
-const MONITOR_POLL_MS         = 5_000;   // intervalo entre tentativas (grupos abertos)
-const MONITOR_HISTORY_LIMIT   = 150;     // mensagens buscadas por chamada
+const MONITOR_POLL_MS         = 5_000;    // intervalo entre tentativas (grupos abertos)
+const MONITOR_HISTORY_LIMIT   = 150;      // mensagens buscadas por chamada
 
 /* ─── Tipos ─── */
 interface Account {
@@ -44,7 +44,7 @@ interface GroupMember {
 interface Group {
   id: string;
   telegram_chat_id: string | null;
-  group_type: "open" | "closed"; // ← NOVO
+  group_type: "open" | "closed";
   group_members: GroupMember[];
 }
 interface Schedule {
@@ -83,6 +83,7 @@ async function getOrResolvePeer(
   const chatIdNum = parseInt(telegramChatId, 10);
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
+  // Tentativa 1: getInputEntity direto (funciona se dialogs já foram sincronizados)
   try {
     const peer = await client.getInputEntity(chatIdNum);
     peerCache.set(telegramChatId, peer);
@@ -92,6 +93,7 @@ async function getOrResolvePeer(
     console.warn(`[peer] getInputEntity falhou para ${telegramChatId}: ${e1.message}`);
   }
 
+  // Tentativa 2: channels.GetChannels via MTProto (funciona para supergrupos/canais)
   const absId     = Math.abs(chatIdNum);
   const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
 
@@ -121,6 +123,7 @@ async function getOrResolvePeer(
     console.warn(`[peer] GetChannels falhou para ${telegramChatId}: ${e2.message}`);
   }
 
+  // Tentativa 3: sincroniza dialogs e tenta de novo
   try {
     console.warn(`[peer] Sincronizando dialogs para resolver ${telegramChatId}...`);
     await client.getDialogs({ limit: 200 });
@@ -138,9 +141,9 @@ async function getOrResolvePeer(
 
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
-  private clients         = new Map<string, TelegramClient>();
-  private sessions        = new Map<string, string>();
-  private keepaliveTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private clients            = new Map<string, TelegramClient>();
+  private sessions           = new Map<string, string>();
+  private keepaliveTimers    = new Map<string, ReturnType<typeof setInterval>>();
   private connectingPromises = new Map<string, Promise<TelegramClient>>();
 
   private startKeepalive(accountId: string, client: TelegramClient): void {
@@ -204,7 +207,7 @@ class TelegramClientPool {
           connectionRetries: 5,
           retryDelay: 1_000,
           autoReconnect: true,
-          sequentialUpdates: false,
+          receiveUpdates: false,  // ← FIX: desliga o _updateLoop (causava TIMEOUT spam)
           floodSleepThreshold: 60,
           requestRetries: 3,
         }
@@ -212,6 +215,7 @@ class TelegramClientPool {
 
       await client.connect();
 
+      // Warm-up: sincroniza dialogs para getInputEntity funcionar
       try {
         await client.getDialogs({ limit: 100 });
         console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
@@ -267,9 +271,9 @@ process.on("SIGINT",  shutdown);
 /* ─── Helpers ─── */
 function isRetryableError(msg: string): boolean {
   const upper = msg.toUpperCase();
-  if (upper.includes("AUTH_KEY_UNREGISTERED"))  return false;
-  if (upper.includes("USER_DEACTIVATED"))       return false;
-  if (upper.includes("SESSION_REVOKED"))        return false;
+  if (upper.includes("AUTH_KEY_UNREGISTERED")) return false;
+  if (upper.includes("USER_DEACTIVATED"))      return false;
+  if (upper.includes("SESSION_REVOKED"))       return false;
   return true;
 }
 
@@ -313,7 +317,7 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
-/* ─── DEDUPLICAÇÃO ─── */
+/* ─── Deduplicação ─── */
 async function getAlreadySentAccountIds(schedule: Schedule): Promise<Set<string>> {
   const cycleStart = schedule.retry_until
     ? new Date(
@@ -336,7 +340,7 @@ async function getAlreadySentAccountIds(schedule: Schedule): Promise<Set<string>
   return new Set((data ?? []).map((r) => r.account_id as string));
 }
 
-/* ─── Envio agressivo ─── */
+/* ─── Envio agressivo com retry interno ─── */
 async function sendAggressively(
   client: TelegramClient,
   account: Account,
@@ -386,6 +390,7 @@ async function sendAggressively(
 
               if (waitMs < budgetEnd - Date.now() - 500) {
                 await new Promise((r) => setTimeout(r, waitMs));
+                peerCache.delete(telegramChatId);
                 const freshPeer = await getOrResolvePeer(client, telegramChatId);
                 await client.sendMessage(freshPeer as any, { message: messageText });
                 return;
@@ -407,7 +412,7 @@ async function sendAggressively(
       return;
 
     } catch (err: unknown) {
-      const errMsg = (err as any)?.message ?? String(err);
+      const errMsg    = (err as any)?.message ?? String(err);
       const remaining = budgetEnd - Date.now();
       if (remaining > 500) {
         console.warn(`[retry] tentativa ${attempt} falhou (${Math.round(remaining / 1000)}s restantes): ${errMsg}`);
@@ -484,12 +489,12 @@ async function processMembersOf(
 
 /* ─────────────────────────────────────────────────────────────────────────
    MONITORAMENTO DE POSIÇÃO — fire-and-forget, zero impacto no disparo
-   
+
    Lógica:
    - Grupos fechados: espera MONITOR_DELAY_CLOSED_MS, busca histórico uma vez
-   - Grupos abertos:  faz polling até as mensagens aparecerem (após aprovação
-                      da admin) ou até MONITOR_MAX_OPEN_MS expirar
-   
+   - Grupos abertos:  polling até mensagens aparecerem (pós-aprovação do admin)
+                      ou até MONITOR_MAX_OPEN_MS expirar
+
    Posição = rank cronológico entre TODAS as mensagens visíveis na janela de
    tempo que começa 15s antes do disparo. Posição 1 = primeira mensagem.
    ─────────────────────────────────────────────────────────────────────── */
@@ -502,7 +507,6 @@ async function monitorPositions(
 ): Promise<void> {
   if (sentMembers.length === 0) return;
 
-  // Pega um client já conectado (qualquer conta que enviou)
   const account = accountCache.get(sentMembers[0].account_id);
   if (!account) {
     console.warn("[monitor] Conta não encontrada no cache — monitoramento de posição ignorado");
@@ -515,12 +519,10 @@ async function monitorPositions(
     return;
   }
 
-  // Janela: começa 15s antes do disparo (margem para clock skew)
   const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
   const deadline        = Date.now() + (groupType === "closed" ? MONITOR_DELAY_CLOSED_MS + 10_000 : MONITOR_MAX_OPEN_MS);
   const ourTexts        = new Set(sentMembers.map((m) => m.message_text).filter(Boolean));
 
-  // Para grupos fechados, aguarda as mensagens propagarem antes de buscar
   if (groupType === "closed") {
     await new Promise((r) => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
   }
@@ -533,14 +535,14 @@ async function monitorPositions(
 
       const result = await client.invoke(
         new Api.messages.GetHistory({
-          peer:      peer as any,
-          limit:     MONITOR_HISTORY_LIMIT,
+          peer:       peer as any,
+          limit:      MONITOR_HISTORY_LIMIT,
           offsetDate: 0,
-          offsetId:  0,
-          maxId:     0,
-          minId:     0,
-          hash:      bigInt(0),
-          addOffset: 0,
+          offsetId:   0,
+          maxId:      0,
+          minId:      0,
+          hash:       bigInt(0),
+          addOffset:  0,
         })
       ) as any;
 
@@ -549,7 +551,7 @@ async function monitorPositions(
       // Filtra janela de tempo e ordena cronologicamente (GetHistory = mais recente primeiro)
       const windowMsgs = allMsgs
         .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-        .reverse(); // agora cronológico: [0] = mais antigo = posição 1
+        .reverse(); // [0] = mais antigo = posição 1
 
       if (windowMsgs.length === 0) {
         if (groupType === "closed") {
@@ -560,25 +562,18 @@ async function monitorPositions(
         continue;
       }
 
-      // Verifica se alguma das nossas mensagens já apareceu
       const anyFound = windowMsgs.some((m: any) => ourTexts.has(m.message));
 
       if (!anyFound && groupType === "open") {
-        // Ainda não aprovadas — continua polling
         await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
 
-      // Atribui posições
-      // FIX: use Promise<unknown>[] and wrap each Supabase builder in Promise.resolve()
-      // so TypeScript sees a proper Promise (PostgrestFilterBuilder is a thenable but
-      // lacks .catch / .finally, causing TS2345 when typed as Promise<any>[]).
       const updates: Promise<unknown>[] = [];
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
 
       for (const sm of sentMembers) {
         if (!sm.message_text) continue;
-        // findIndex = posição cronológica (0-based) → rank 1-based
         const idx = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
         if (idx < 0) continue;
 
@@ -657,10 +652,10 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — serão pulados.`);
   }
 
-  // ── DISPARO (inalterado) ──
+  // ── DISPARO ──
   const results = await processMembersOf(schedule, alreadySent);
 
-  // ── MONITORAMENTO DE POSIÇÃO (fire-and-forget — não bloqueia nada) ──
+  // ── MONITORAMENTO DE POSIÇÃO (fire-and-forget) ──
   const sentForMonitor = results
     .filter((r) => r.status === "sent")
     .map((r) => {
@@ -679,17 +674,17 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     ).catch((err) => console.error("[monitor] Erro não capturado:", err.message));
   }
 
-  // ── ATUALIZAÇÃO DO SCHEDULE (inalterada) ──
+  // ── ATUALIZAÇÃO DO SCHEDULE ──
   const sentCount         = results.filter((r) => r.status === "sent").length;
   const skippedCount      = results.filter((r) => r.status === "skipped").length;
   const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
   const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
   const totalDelivered    = sentCount + skippedCount;
 
-  const hasActiveMembers  = (group.group_members ?? []).some(
+  const hasActiveMembers = (group.group_members ?? []).some(
     (m) => m.is_active && m.accounts?.is_active
   );
-  const allSucceeded      =
+  const allSucceeded =
     hasActiveMembers &&
     retryableFailures.length === 0 &&
     permanentFailures.length === 0 &&
@@ -706,13 +701,13 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }
 
     await supabase.from("schedules").update({
-      next_run_at:          nextRun,
-      last_run_at:          nowISO,
-      retry_until:          null,
-      retry_count:          0,
-      last_attempt_at:      nowISO,
-      last_attempt_status:  "sent",
-      last_attempt_error:   null,
+      next_run_at:         nextRun,
+      last_run_at:         nowISO,
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "sent",
+      last_attempt_error:  null,
     }).eq("id", scheduleId);
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
