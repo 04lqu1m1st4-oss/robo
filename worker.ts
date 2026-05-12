@@ -505,6 +505,64 @@ async function processMembersOf(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+   AGUARDA SINAL DO ADMIN (grupos abertos)
+   Fica em polling até detectar:
+     - Texto "ok" (qualquer capitalização)
+     - Qualquer mídia / foto
+   Retorna true se detectou, false se estourou o timeout.
+   ─────────────────────────────────────────────────────────────────────── */
+async function waitForAdminSignal(
+  client: TelegramClient,
+  telegramChatId: string,
+  timeoutMs: number = 30 * 60_000   // espera até 30 min por padrão
+): Promise<boolean> {
+  const deadline      = Date.now() + timeoutMs;
+  const startUnix     = Math.floor((Date.now() - 5_000) / 1000); // janela com 5s de folga
+
+  console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
+
+  while (Date.now() < deadline) {
+    try {
+      const peer = await getOrResolvePeer(client, telegramChatId);
+
+      const result = await client.invoke(
+        new Api.messages.GetHistory({
+          peer:       peer as any,
+          limit:      20,
+          offsetDate: 0,
+          offsetId:   0,
+          maxId:      0,
+          minId:      0,
+          hash:       bigInt(0),
+          addOffset:  0,
+        })
+      ) as any;
+
+      const recentMsgs: any[] = (result.messages ?? [])
+        .filter((m: any) => m._ === "message" && m.date >= startUnix);
+
+      const signal = recentMsgs.some((m: any) => {
+        const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
+        const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+        return isOk || isMedia;
+      });
+
+      if (signal) {
+        console.log(`[admin-signal] ✓ Sinal do admin detectado em ${telegramChatId}`);
+        return true;
+      }
+    } catch (err: any) {
+      console.warn(`[admin-signal] Erro ao buscar histórico: ${err.message}`);
+    }
+
+    await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
+  }
+
+  console.warn(`[admin-signal] Timeout — nenhum sinal do admin em ${telegramChatId}`);
+  return false;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
    MONITORAMENTO DE POSIÇÃO — fire-and-forget, zero impacto no disparo
 
    Lógica:
@@ -582,71 +640,10 @@ async function monitorPositions(
       const ourMessagesVisible = windowMsgs.some((m: any) => ourTexts.has(m.message));
 
       if (groupType === "open" && !ourMessagesVisible) {
-        // Aguarda sinal do admin: texto "ok" (qualquer case) ou qualquer mídia/foto
-        const adminSignal = windowMsgs.some((m: any) => {
-          const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
-          const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
-          return isOk || isMedia;
-        });
-
-        if (!adminSignal) {
-          await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
-          continue;
-        }
-
-        // Sinal detectado — aguarda 3s para mensagens propagarem e busca de novo
-        console.log(`[monitor] ✓ Sinal do admin detectado em ${telegramChatId} — aguardando propagação...`);
-        await new Promise((r) => setTimeout(r, 3_000));
-
-        // Re-busca histórico atualizado
-        try {
-          const freshResult = await client.invoke(
-            new Api.messages.GetHistory({
-              peer:       peer as any,
-              limit:      MONITOR_HISTORY_LIMIT,
-              offsetDate: 0,
-              offsetId:   0,
-              maxId:      0,
-              minId:      0,
-              hash:       bigInt(0),
-              addOffset:  0,
-            })
-          ) as any;
-
-          const freshMsgs = (freshResult.messages ?? [])
-            .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-            .reverse();
-
-          const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
-          const updates: Promise<unknown>[] = [];
-
-          for (const sm of sentMembers) {
-            if (!sm.message_text) continue;
-            const idx = freshMsgs.findIndex((m: any) => m.message === sm.message_text);
-            if (idx < 0) {
-              console.warn(`[monitor] Mensagem de ${sm.account_id} ainda não visível após sinal do admin`);
-              continue;
-            }
-            const rank = idx + 1;
-            console.log(`[monitor] ${sm.account_id}: #${rank} em ${telegramChatId} (pós-aprovação)`);
-            updates.push(
-              Promise.resolve(
-                supabase.from("dispatch_logs")
-                  .update({ position_rank: rank })
-                  .eq("schedule_id", scheduleId)
-                  .eq("account_id",  sm.account_id)
-                  .eq("status",      "sent")
-                  .gte("sent_at",    cutoff)
-              )
-            );
-          }
-
-          await Promise.allSettled(updates);
-          console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId} (pós-aprovação)`);
-        } catch (freshErr: any) {
-          console.warn(`[monitor] Erro ao re-buscar histórico pós-sinal: ${freshErr.message}`);
-        }
-        return;
+        // Para grupos abertos o envio já ocorreu após o ok do admin.
+        // Se as mensagens ainda não estão visíveis, aguarda mais um pouco.
+        await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
+        continue;
       }
 
       const updates: Promise<unknown>[] = [];
@@ -726,6 +723,23 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   }
 
   console.log(`[timer] ⚡ Disparando schedule ${scheduleId} às ${nowISO}`);
+
+  // Grupos abertos: só envia após o ok do admin
+  if (group.group_type === "open") {
+    const firstAccount = (group.group_members ?? [])
+      .find((m) => m.is_active && m.accounts?.is_active)?.accounts;
+
+    if (firstAccount) {
+      const client = await clientPool.get(firstAccount).catch(() => null);
+      if (client) {
+        const gotSignal = await waitForAdminSignal(client, group.telegram_chat_id!);
+        if (!gotSignal) {
+          console.warn(`[timer] Schedule ${scheduleId}: timeout aguardando ok do admin — abortando ciclo.`);
+          return;
+        }
+      }
+    }
+  }
 
   const alreadySent = await getAlreadySentAccountIds(schedule);
   if (alreadySent.size > 0) {
