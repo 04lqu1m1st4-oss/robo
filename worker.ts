@@ -481,7 +481,7 @@ async function trySendMember(
   return { member_id: member.id, account_id: account.id, status: logStatus, retryable, error: errorMsg };
 }
 
-/* ─── Processa membros em paralelo ─── */
+/* ─── Processa membros sequencialmente (evita duplicatas em grupo fechado) ─── */
 async function processMembersOf(
   schedule: Schedule,
   alreadySent: Set<string>
@@ -492,9 +492,21 @@ async function processMembersOf(
     .filter((m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
     .sort((a, b) => a.position - b.position);
 
-  const results = await Promise.all(
-    members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
-  );
+  const results: MemberResult[] = [];
+
+  if (group.group_type === "closed") {
+    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
+    for (const member of members) {
+      const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
+      results.push(result);
+    }
+  } else {
+    // Grupo aberto: paralelismo mantido
+    const parallel = await Promise.all(
+      members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
+    );
+    results.push(...parallel);
+  }
 
   return results;
 }
