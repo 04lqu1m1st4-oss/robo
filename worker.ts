@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v5 — missed-schedule recovery: dispara schedules presos no passado após restart
+// v6 — fix Railway: usa WSS (WebSocket/443) ao invés de TCPFull/80, que o Railway derruba
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -220,10 +220,11 @@ class TelegramClientPool {
           autoReconnect: true,
           floodSleepThreshold: 60,
           requestRetries: 3,
+          // FIX v6: Railway derruba TCPFull na porta 80 (trata como HTTP inválido).
+          // useWSS=true usa WebSocket sobre TLS/443, que o Railway suporta perfeitamente.
+          useWSS: true,
         }
       );
-
-      (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
