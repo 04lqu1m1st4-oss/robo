@@ -984,8 +984,9 @@ async function prewarmAccounts(): Promise<void> {
    já estabelecida pelo worker, evitando AUTH_KEY_DUPLICATED.
 
    Rotas:
-     GET /accounts/:id/chats
-     GET /accounts/:id/chat-members?chat_id=XXXX
+     GET  /accounts/:id/chats
+     GET  /accounts/:id/chat-members?chat_id=XXXX
+     POST /accounts/:id/reload          ← força prewarm imediato de uma conta
 
    Protegido por WORKER_SECRET (header x-worker-secret).
    ─────────────────────────────────────────────────────────────────────────── */
@@ -1117,6 +1118,41 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, members);
     } catch (err: any) {
       console.error("[http] /chat-members erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // POST /accounts/:id/reload — força o worker a buscar e conectar uma conta nova/atualizada
+  // Chamado pelo Next.js após autenticar uma conta (verify), evitando 404 por cache frio.
+  const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
+  if (req.method === "POST" && reloadMatch) {
+    const accountId = reloadMatch[1];
+
+    try {
+      const { data, error } = await supabase
+        .from("accounts")
+        .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+        .eq("id", accountId)
+        .eq("is_active", true)
+        .single();
+
+      if (error || !data) {
+        return jsonResponse(res, 404, { error: "Conta não encontrada ou inativa no banco" });
+      }
+
+      const account = data as Account;
+      accountCache.set(account.id, account);
+
+      // Conecta em background — não aguarda para não travar o response
+      clientPool.get(account).then(() => {
+        console.log(`[reload] ✓ Conta ${account.phone_number} carregada no pool via /reload`);
+      }).catch((err: any) => {
+        console.warn(`[reload] Falha ao conectar ${account.phone_number} via /reload: ${err.message}`);
+      });
+
+      return jsonResponse(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error("[http] /reload erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
