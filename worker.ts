@@ -79,8 +79,8 @@ interface DialogCacheEntry {
   chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
   fetchedAt: number;
 }
-const dialogCache           = new Map<string, DialogCacheEntry>();
-const DIALOG_CACHE_TTL_MS   = 5 * 60_000; // 5 minutos
+const dialogCache         = new Map<string, DialogCacheEntry>();
+const DIALOG_CACHE_TTL_MS = 5 * 60_000; // 5 minutos
 
 async function fetchAndCacheDialogs(
   client: TelegramClient,
@@ -256,26 +256,24 @@ class TelegramClientPool {
       (client as any)._updateLoop = () => Promise.resolve();
 
       // Retry com backoff exponencial para AUTH_KEY_DUPLICATED.
-      // Ocorre quando o servidor Telegram ainda vê a sessão anterior como ativa
-      // (ex.: reconexão após evicção, ou dois workers simultâneos durante deploy Railway).
       for (let attempt = 1; attempt <= 4; attempt++) {
         try {
           await client.connect();
-          break; // sucesso — sai do loop
+          break;
         } catch (err: any) {
           const isDuplicated =
             err?.message?.includes("AUTH_KEY_DUPLICATED") ||
             String(err).includes("AUTH_KEY_DUPLICATED");
 
           if (isDuplicated && attempt < 4) {
-            const waitMs = attempt * 3_000; // 3 s, 6 s, 9 s
+            const waitMs = attempt * 3_000;
             console.warn(
               `[pool] AUTH_KEY_DUPLICATED para ${account.phone_number} ` +
               `(tentativa ${attempt}/4) — aguardando ${waitMs / 1000}s antes de tentar novamente...`
             );
             await new Promise((r) => setTimeout(r, waitMs));
           } else {
-            throw err; // erro diferente ou esgotou as 4 tentativas
+            throw err;
           }
         }
       }
@@ -548,13 +546,11 @@ async function processMembersOf(
   const results: MemberResult[] = [];
 
   if (group.group_type === "closed") {
-    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
     for (const member of members) {
       const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
       results.push(result);
     }
   } else {
-    // Grupo aberto: paralelismo mantido
     const parallel = await Promise.all(
       members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
     );
@@ -569,8 +565,8 @@ async function waitForAdminSignal(
   telegramChatId: string,
   timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
-  const deadline      = Date.now() + timeoutMs;
-  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
+  const deadline  = Date.now() + timeoutMs;
+  const startUnix = Math.floor((Date.now() - 5_000) / 1000);
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -663,8 +659,7 @@ async function monitorPositions(
         })
       ) as any;
 
-      const allMsgs: any[] = result.messages ?? [];
-
+      const allMsgs: any[]  = result.messages ?? [];
       const windowMsgs = allMsgs
         .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
         .reverse();
@@ -1039,7 +1034,7 @@ async function prewarmAccounts(): Promise<void> {
    Rotas:
      GET  /accounts/:id/chats
      GET  /accounts/:id/chat-members?chat_id=XXXX
-     POST /accounts/:id/reload          ← força prewarm imediato de uma conta
+     POST /accounts/:id/reload
 
    Protegido por WORKER_SECRET (header x-worker-secret).
    ─────────────────────────────────────────────────────────────────────────── */
@@ -1053,7 +1048,6 @@ function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
 }
 
 const httpServer = http.createServer(async (req, res) => {
-  // Autenticação
   if (WORKER_SECRET && req.headers["x-worker-secret"] !== WORKER_SECRET) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
@@ -1073,7 +1067,6 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       const client = await clientPool.get(account);
 
-      // Usa cache se ainda válido, senão busca e atualiza
       const cached = dialogCache.get(accountId);
       let chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
 
@@ -1099,14 +1092,14 @@ const httpServer = http.createServer(async (req, res) => {
     const chatId    = url.searchParams.get("chat_id");
     const account   = accountCache.get(accountId);
 
-    if (!chatId)    return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
-    if (!account)   return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
 
     type MemberOut = { id: string; name: string | null; username: string | null; phone: string | null };
 
     try {
-      const client    = await clientPool.get(account);
-      const rawId     = chatId.replace(/^-/, "");
+      const client       = await clientPool.get(account);
+      const rawId        = chatId.replace(/^-/, "");
       const isSupergroup = chatId.startsWith("-100");
       let members: MemberOut[] = [];
 
@@ -1177,8 +1170,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /accounts/:id/reload — força o worker a buscar e conectar uma conta nova/atualizada
-  // Chamado pelo Next.js após autenticar uma conta (verify), evitando 404 por cache frio.
+  // POST /accounts/:id/reload
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1198,7 +1190,44 @@ const httpServer = http.createServer(async (req, res) => {
       const account = data as Account;
       accountCache.set(account.id, account);
 
-      // Conecta em background — não aguarda para não travar o response
       clientPool.get(account).then(() => {
         console.log(`[reload] ✓ Conta ${account.phone_number} carregada no pool via /reload`);
-  
+      }).catch((err: any) => {
+        console.warn(`[reload] Falha ao conectar ${account.phone_number} via /reload: ${err.message}`);
+      });
+
+      return jsonResponse(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error("[http] /reload erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  jsonResponse(res, 404, { error: "Not found" });
+});
+
+httpServer.listen(WORKER_PORT, () => {
+  console.log(`[worker] HTTP interno escutando na porta ${WORKER_PORT}`);
+});
+
+/* ─── Inicialização ─── */
+async function init(): Promise<void> {
+  console.log("[worker] Iniciando...");
+  await prewarmAccounts();
+  await reloadSchedules();
+
+  setInterval(async () => {
+    try {
+      await Promise.allSettled([reloadSchedules(), prewarmAccounts()]);
+    } catch (err) {
+      console.error("[reload] Erro no reload periódico:", err);
+    }
+  }, RELOAD_INTERVAL_MS);
+
+  console.log("[worker] Pronto.");
+}
+
+init().catch((err) => {
+  console.error("[worker] Falha na inicialização:", err);
+  process.exit(1);
+});
