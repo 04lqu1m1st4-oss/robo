@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v6 — dialog cache para evitar timeout no endpoint /chats
+// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -73,32 +73,6 @@ interface MemberResult {
 /* ─── Peer cache ─── */
 const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
-
-/* ─── Dialog cache (para o endpoint HTTP /chats) ─── */
-interface DialogCacheEntry {
-  chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
-  fetchedAt: number;
-}
-const dialogCache         = new Map<string, DialogCacheEntry>();
-const DIALOG_CACHE_TTL_MS = 5 * 60_000; // 5 minutos
-
-async function fetchAndCacheDialogs(
-  client: TelegramClient,
-  accountId: string
-): Promise<Array<{ id: string; name: string; type: "channel" | "group" }>> {
-  const dialogs = await client.getDialogs({ limit: 200 });
-  const chats = dialogs
-    .filter((d) => d.isGroup || d.isChannel)
-    .map((d) => ({
-      id:   String(d.id),
-      name: d.title ?? d.name ?? "Sem nome",
-      type: (d.isChannel ? "channel" : "group") as "channel" | "group",
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  dialogCache.set(accountId, { chats, fetchedAt: Date.now() });
-  return chats;
-}
 
 /* ─── Resolve peer com múltiplos fallbacks ─── */
 async function getOrResolvePeer(
@@ -230,10 +204,6 @@ class TelegramClientPool {
       if (existing) {
         try { await existing.disconnect(); } catch {}
         this._evict(account.id);
-        // Aguarda o servidor Telegram liberar a auth_key antes de reconectar.
-        // Sem esse delay, o novo connect() chega antes de o servidor Telegram
-        // encerrar a sessão anterior, causando AUTH_KEY_DUPLICATED.
-        await new Promise((r) => setTimeout(r, 2_000));
       }
 
       if (sessionChanged && sessionInUse) {
@@ -255,32 +225,11 @@ class TelegramClientPool {
 
       (client as any)._updateLoop = () => Promise.resolve();
 
-      // Retry com backoff exponencial para AUTH_KEY_DUPLICATED.
-      for (let attempt = 1; attempt <= 4; attempt++) {
-        try {
-          await client.connect();
-          break;
-        } catch (err: any) {
-          const isDuplicated =
-            err?.message?.includes("AUTH_KEY_DUPLICATED") ||
-            String(err).includes("AUTH_KEY_DUPLICATED");
-
-          if (isDuplicated && attempt < 4) {
-            const waitMs = attempt * 3_000;
-            console.warn(
-              `[pool] AUTH_KEY_DUPLICATED para ${account.phone_number} ` +
-              `(tentativa ${attempt}/4) — aguardando ${waitMs / 1000}s antes de tentar novamente...`
-            );
-            await new Promise((r) => setTimeout(r, waitMs));
-          } else {
-            throw err;
-          }
-        }
-      }
+      await client.connect();
 
       try {
-        await fetchAndCacheDialogs(client, account.id);
-        console.log(`[pool] ✓ Dialogs sincronizados e cacheados: ${account.phone_number}`);
+        await client.getDialogs({ limit: 100 });
+        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
       } catch (err: any) {
         console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
       }
@@ -546,11 +495,13 @@ async function processMembersOf(
   const results: MemberResult[] = [];
 
   if (group.group_type === "closed") {
+    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
     for (const member of members) {
       const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
       results.push(result);
     }
   } else {
+    // Grupo aberto: paralelismo mantido
     const parallel = await Promise.all(
       members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
     );
@@ -565,8 +516,8 @@ async function waitForAdminSignal(
   telegramChatId: string,
   timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
-  const deadline  = Date.now() + timeoutMs;
-  const startUnix = Math.floor((Date.now() - 5_000) / 1000);
+  const deadline      = Date.now() + timeoutMs;
+  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -659,7 +610,8 @@ async function monitorPositions(
         })
       ) as any;
 
-      const allMsgs: any[]  = result.messages ?? [];
+      const allMsgs: any[] = result.messages ?? [];
+
       const windowMsgs = allMsgs
         .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
         .reverse();
@@ -1032,9 +984,8 @@ async function prewarmAccounts(): Promise<void> {
    já estabelecida pelo worker, evitando AUTH_KEY_DUPLICATED.
 
    Rotas:
-     GET  /accounts/:id/chats
-     GET  /accounts/:id/chat-members?chat_id=XXXX
-     POST /accounts/:id/reload
+     GET /accounts/:id/chats
+     GET /accounts/:id/chat-members?chat_id=XXXX
 
    Protegido por WORKER_SECRET (header x-worker-secret).
    ─────────────────────────────────────────────────────────────────────────── */
@@ -1048,6 +999,7 @@ function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
 }
 
 const httpServer = http.createServer(async (req, res) => {
+  // Autenticação
   if (WORKER_SECRET && req.headers["x-worker-secret"] !== WORKER_SECRET) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
@@ -1065,20 +1017,19 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     try {
-      const client = await clientPool.get(account);
+      const client  = await clientPool.get(account);
+      const dialogs = await client.getDialogs({ limit: 200 });
+      const chats   = dialogs
+        .filter((d) => d.isGroup || d.isChannel)
+        .map((d) => ({
+          id:          String(d.id),
+          name:        d.title ?? d.name ?? "Sem nome",
+          type:        d.isChannel ? "channel" : "group",
+          accessHash:  null,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
 
-      const cached = dialogCache.get(accountId);
-      let chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
-
-      if (cached && Date.now() - cached.fetchedAt < DIALOG_CACHE_TTL_MS) {
-        console.log(`[http] /chats cache hit para ${accountId}`);
-        chats = cached.chats;
-      } else {
-        console.log(`[http] /chats buscando dialogs frescos para ${accountId}...`);
-        chats = await fetchAndCacheDialogs(client, accountId);
-      }
-
-      return jsonResponse(res, 200, chats.map((c) => ({ ...c, accessHash: null })));
+      return jsonResponse(res, 200, chats);
     } catch (err: any) {
       console.error("[http] /chats erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
@@ -1092,14 +1043,14 @@ const httpServer = http.createServer(async (req, res) => {
     const chatId    = url.searchParams.get("chat_id");
     const account   = accountCache.get(accountId);
 
-    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
-    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    if (!chatId)    return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account)   return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
 
     type MemberOut = { id: string; name: string | null; username: string | null; phone: string | null };
 
     try {
-      const client       = await clientPool.get(account);
-      const rawId        = chatId.replace(/^-/, "");
+      const client    = await clientPool.get(account);
+      const rawId     = chatId.replace(/^-/, "");
       const isSupergroup = chatId.startsWith("-100");
       let members: MemberOut[] = [];
 
@@ -1166,39 +1117,6 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, members);
     } catch (err: any) {
       console.error("[http] /chat-members erro:", err.message);
-      return jsonResponse(res, 500, { error: err.message });
-    }
-  }
-
-  // POST /accounts/:id/reload
-  const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
-  if (req.method === "POST" && reloadMatch) {
-    const accountId = reloadMatch[1];
-
-    try {
-      const { data, error } = await supabase
-        .from("accounts")
-        .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
-        .eq("id", accountId)
-        .eq("is_active", true)
-        .single();
-
-      if (error || !data) {
-        return jsonResponse(res, 404, { error: "Conta não encontrada ou inativa no banco" });
-      }
-
-      const account = data as Account;
-      accountCache.set(account.id, account);
-
-      clientPool.get(account).then(() => {
-        console.log(`[reload] ✓ Conta ${account.phone_number} carregada no pool via /reload`);
-      }).catch((err: any) => {
-        console.warn(`[reload] Falha ao conectar ${account.phone_number} via /reload: ${err.message}`);
-      });
-
-      return jsonResponse(res, 200, { ok: true });
-    } catch (err: any) {
-      console.error("[http] /reload erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
