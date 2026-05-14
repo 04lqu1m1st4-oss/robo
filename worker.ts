@@ -1121,6 +1121,82 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // GET /accounts/:id/dialogs
+  const dialogsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/dialogs$/);
+  if (req.method === "GET" && dialogsMatch) {
+    const accountId = dialogsMatch[1];
+    const account   = accountCache.get(accountId);
+
+    if (!account) {
+      return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    }
+
+    try {
+      const client  = await clientPool.get(account);
+      const dialogs = await client.getDialogs({ limit: 200 });
+      const result  = dialogs
+        .filter((d) => d.isGroup || d.isChannel)
+        .map((d) => ({
+          id:         String(d.id),
+          name:       d.title ?? d.name ?? "Sem nome",
+          type:       d.isChannel ? "channel" : "group",
+          accessHash: null,
+          members:    (d.entity as any)?.participantsCount ?? null,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      return jsonResponse(res, 200, result);
+    } catch (err: any) {
+      console.error("[http] /dialogs erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // GET /accounts/:id/chat-count?chat_id=XXXX
+  const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
+  if (req.method === "GET" && chatCountMatch) {
+    const accountId = chatCountMatch[1];
+    const chatId    = url.searchParams.get("chat_id");
+    const account   = accountCache.get(accountId);
+
+    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+
+    try {
+      const client = await clientPool.get(account);
+      const rawId  = chatId.replace(/^-/, "");
+      let count: number | null = null;
+
+      const dialogs = await client.getDialogs({ limit: 500 });
+      const dialog  = dialogs.find((d) => {
+        const dId = String(d.id);
+        return dId === rawId || dId === chatId || `-${dId}` === chatId || `-100${dId}` === chatId;
+      });
+
+      if (dialog?.entity) {
+        const entity = dialog.entity as any;
+        if (entity.participantsCount != null) {
+          count = entity.participantsCount;
+        } else if (entity.className === "Channel") {
+          const full = await client.invoke(
+            new Api.channels.GetFullChannel({ channel: entity })
+          ) as any;
+          count = full.fullChat?.participantsCount ?? null;
+        } else if (entity.className === "Chat") {
+          const full = await client.invoke(
+            new Api.messages.GetFullChat({ chatId: entity.id })
+          ) as any;
+          count = full.fullChat?.participants?.participants?.length ?? null;
+        }
+      }
+
+      return jsonResponse(res, 200, { count });
+    } catch (err: any) {
+      console.error("[http] /chat-count erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
   jsonResponse(res, 404, { error: "Not found" });
 });
 
