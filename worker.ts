@@ -984,8 +984,9 @@ async function prewarmAccounts(): Promise<void> {
    já estabelecida pelo worker, evitando AUTH_KEY_DUPLICATED.
 
    Rotas:
-     GET /accounts/:id/chats
-     GET /accounts/:id/chat-members?chat_id=XXXX
+     GET  /accounts/:id/chats
+     GET  /accounts/:id/chat-members?chat_id=XXXX
+     POST /accounts/:id/reload        ← NOVO: força reload de uma conta no cache
 
    Protegido por WORKER_SECRET (header x-worker-secret).
    ─────────────────────────────────────────────────────────────────────────── */
@@ -1006,7 +1007,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
-  // GET /accounts/:id/chats
+  // ── GET /accounts/:id/chats ──────────────────────────────────────────────
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const accountId = chatsMatch[1];
@@ -1036,7 +1037,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /accounts/:id/chat-members?chat_id=XXXX
+  // ── GET /accounts/:id/chat-members?chat_id=XXXX ──────────────────────────
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const accountId = membersMatch[1];
@@ -1117,6 +1118,42 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, members);
     } catch (err: any) {
       console.error("[http] /chat-members erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // ── POST /accounts/:id/reload ─────────────────────────────────────────────
+  // Força o worker a buscar a conta no banco e adicioná-la ao cache/pool.
+  // Necessário para contas adicionadas após o boot do worker.
+  const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
+  if (req.method === "POST" && reloadMatch) {
+    const accountId = reloadMatch[1];
+
+    try {
+      const { data, error } = await supabase
+        .from("accounts")
+        .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+        .eq("id", accountId)
+        .single();
+
+      if (error || !data) {
+        return jsonResponse(res, 404, { error: "Conta não encontrada no banco" });
+      }
+
+      const account = data as Account;
+
+      // Atualiza o cache mesmo que a conta já estivesse lá
+      accountCache.set(accountId, account);
+
+      // Se tem sessão ativa, conecta no pool (ou reconecta se sessão mudou)
+      if (account.session_string && account.is_active) {
+        await clientPool.get(account);
+      }
+
+      console.log(`[http] /reload: conta ${account.phone_number} recarregada no cache`);
+      return jsonResponse(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error("[http] /reload erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
