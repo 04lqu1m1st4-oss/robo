@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
+// v5 — retry com backoff para AUTH_KEY_DUPLICATED + delay pós-disconnect no pool
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -204,6 +204,10 @@ class TelegramClientPool {
       if (existing) {
         try { await existing.disconnect(); } catch {}
         this._evict(account.id);
+        // Aguarda o servidor Telegram liberar a auth_key antes de reconectar.
+        // Sem esse delay, o novo connect() chega antes de o servidor Telegram
+        // encerrar a sessão anterior, causando AUTH_KEY_DUPLICATED.
+        await new Promise((r) => setTimeout(r, 2_000));
       }
 
       if (sessionChanged && sessionInUse) {
@@ -225,7 +229,30 @@ class TelegramClientPool {
 
       (client as any)._updateLoop = () => Promise.resolve();
 
-      await client.connect();
+      // Retry com backoff exponencial para AUTH_KEY_DUPLICATED.
+      // Ocorre quando o servidor Telegram ainda vê a sessão anterior como ativa
+      // (ex.: reconexão após evicção, ou dois workers simultâneos durante deploy Railway).
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        try {
+          await client.connect();
+          break; // sucesso — sai do loop
+        } catch (err: any) {
+          const isDuplicated =
+            err?.message?.includes("AUTH_KEY_DUPLICATED") ||
+            String(err).includes("AUTH_KEY_DUPLICATED");
+
+          if (isDuplicated && attempt < 4) {
+            const waitMs = attempt * 3_000; // 3 s, 6 s, 9 s
+            console.warn(
+              `[pool] AUTH_KEY_DUPLICATED para ${account.phone_number} ` +
+              `(tentativa ${attempt}/4) — aguardando ${waitMs / 1000}s antes de tentar novamente...`
+            );
+            await new Promise((r) => setTimeout(r, waitMs));
+          } else {
+            throw err; // erro diferente ou esgotou as 4 tentativas
+          }
+        }
+      }
 
       try {
         await client.getDialogs({ limit: 100 });
