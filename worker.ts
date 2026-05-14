@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v5 — retry com backoff para AUTH_KEY_DUPLICATED + delay pós-disconnect no pool
+// v6 — dialog cache para evitar timeout no endpoint /chats
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -73,6 +73,32 @@ interface MemberResult {
 /* ─── Peer cache ─── */
 const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
+
+/* ─── Dialog cache (para o endpoint HTTP /chats) ─── */
+interface DialogCacheEntry {
+  chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
+  fetchedAt: number;
+}
+const dialogCache           = new Map<string, DialogCacheEntry>();
+const DIALOG_CACHE_TTL_MS   = 5 * 60_000; // 5 minutos
+
+async function fetchAndCacheDialogs(
+  client: TelegramClient,
+  accountId: string
+): Promise<Array<{ id: string; name: string; type: "channel" | "group" }>> {
+  const dialogs = await client.getDialogs({ limit: 200 });
+  const chats = dialogs
+    .filter((d) => d.isGroup || d.isChannel)
+    .map((d) => ({
+      id:   String(d.id),
+      name: d.title ?? d.name ?? "Sem nome",
+      type: (d.isChannel ? "channel" : "group") as "channel" | "group",
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  dialogCache.set(accountId, { chats, fetchedAt: Date.now() });
+  return chats;
+}
 
 /* ─── Resolve peer com múltiplos fallbacks ─── */
 async function getOrResolvePeer(
@@ -255,8 +281,8 @@ class TelegramClientPool {
       }
 
       try {
-        await client.getDialogs({ limit: 100 });
-        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
+        await fetchAndCacheDialogs(client, account.id);
+        console.log(`[pool] ✓ Dialogs sincronizados e cacheados: ${account.phone_number}`);
       } catch (err: any) {
         console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
       }
@@ -1045,19 +1071,21 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     try {
-      const client  = await clientPool.get(account);
-      const dialogs = await client.getDialogs({ limit: 200 });
-      const chats   = dialogs
-        .filter((d) => d.isGroup || d.isChannel)
-        .map((d) => ({
-          id:          String(d.id),
-          name:        d.title ?? d.name ?? "Sem nome",
-          type:        d.isChannel ? "channel" : "group",
-          accessHash:  null,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
+      const client = await clientPool.get(account);
 
-      return jsonResponse(res, 200, chats);
+      // Usa cache se ainda válido, senão busca e atualiza
+      const cached = dialogCache.get(accountId);
+      let chats: Array<{ id: string; name: string; type: "channel" | "group" }>;
+
+      if (cached && Date.now() - cached.fetchedAt < DIALOG_CACHE_TTL_MS) {
+        console.log(`[http] /chats cache hit para ${accountId}`);
+        chats = cached.chats;
+      } else {
+        console.log(`[http] /chats buscando dialogs frescos para ${accountId}...`);
+        chats = await fetchAndCacheDialogs(client, accountId);
+      }
+
+      return jsonResponse(res, 200, chats.map((c) => ({ ...c, accessHash: null })));
     } catch (err: any) {
       console.error("[http] /chats erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
@@ -1173,42 +1201,4 @@ const httpServer = http.createServer(async (req, res) => {
       // Conecta em background — não aguarda para não travar o response
       clientPool.get(account).then(() => {
         console.log(`[reload] ✓ Conta ${account.phone_number} carregada no pool via /reload`);
-      }).catch((err: any) => {
-        console.warn(`[reload] Falha ao conectar ${account.phone_number} via /reload: ${err.message}`);
-      });
-
-      return jsonResponse(res, 200, { ok: true });
-    } catch (err: any) {
-      console.error("[http] /reload erro:", err.message);
-      return jsonResponse(res, 500, { error: err.message });
-    }
-  }
-
-  jsonResponse(res, 404, { error: "Not found" });
-});
-
-httpServer.listen(WORKER_PORT, () => {
-  console.log(`[worker] HTTP interno escutando na porta ${WORKER_PORT}`);
-});
-
-/* ─── Inicialização ─── */
-async function init(): Promise<void> {
-  console.log("[worker] Iniciando...");
-  await prewarmAccounts();
-  await reloadSchedules();
-
-  setInterval(async () => {
-    try {
-      await Promise.allSettled([reloadSchedules(), prewarmAccounts()]);
-    } catch (err) {
-      console.error("[reload] Erro no reload periódico:", err);
-    }
-  }, RELOAD_INTERVAL_MS);
-
-  console.log("[worker] Pronto.");
-}
-
-init().catch((err) => {
-  console.error("[worker] Falha na inicialização:", err);
-  process.exit(1);
-});
+  
