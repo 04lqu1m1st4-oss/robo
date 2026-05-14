@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v6 — fix Railway: usa WSS (WebSocket/443) ao invés de TCPFull/80, que o Railway derruba
+// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -192,7 +192,7 @@ class TelegramClientPool {
 
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
-    const sessionInUse   = new Map(this.sessions).get(account.id);
+    const sessionInUse   = this.sessions.get(account.id);
     const sessionChanged = sessionInUse !== account.session_string;
 
     if (existing?.connected && !sessionChanged) return existing;
@@ -220,11 +220,10 @@ class TelegramClientPool {
           autoReconnect: true,
           floodSleepThreshold: 60,
           requestRetries: 3,
-          // FIX v6: Railway derruba TCPFull na porta 80 (trata como HTTP inválido).
-          // useWSS=true usa WebSocket sobre TLS/443, que o Railway suporta perfeitamente.
-          useWSS: true,
         }
       );
+
+      (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
@@ -496,11 +495,13 @@ async function processMembersOf(
   const results: MemberResult[] = [];
 
   if (group.group_type === "closed") {
+    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
     for (const member of members) {
       const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
       results.push(result);
     }
   } else {
+    // Grupo aberto: paralelismo mantido
     const parallel = await Promise.all(
       members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
     );
@@ -515,8 +516,8 @@ async function waitForAdminSignal(
   telegramChatId: string,
   timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
-  const deadline  = Date.now() + timeoutMs;
-  const startUnix = Math.floor((Date.now() - 5_000) / 1000);
+  const deadline      = Date.now() + timeoutMs;
+  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -868,9 +869,7 @@ async function reloadSchedules(): Promise<void> {
     { data: futureSchedules },
     { data: retrySchedules  },
     { data: expiredRetries  },
-    { data: missedSchedules }, // ← v5: schedules que ficaram presos no passado
   ] = await Promise.all([
-    // 1. Schedules normais dentro da janela de lookahead
     supabase
       .from("schedules")
       .select("id, next_run_at")
@@ -878,7 +877,6 @@ async function reloadSchedules(): Promise<void> {
       .is("retry_until", null)
       .lte("next_run_at", lookaheadISO),
 
-    // 2. Schedules em retry ainda dentro do prazo
     supabase
       .from("schedules")
       .select(`
@@ -893,26 +891,14 @@ async function reloadSchedules(): Promise<void> {
       .not("retry_until", "is", null)
       .gt("retry_until", nowISO),
 
-    // 3. Schedules em retry expirados — avança para próxima semana
     supabase
       .from("schedules")
       .select("id, cron_expression")
       .eq("is_active", true)
       .not("retry_until", "is", null)
       .lte("retry_until", nowISO),
-
-    // 4. ← FIX v5: Schedules perdidos (next_run_at no passado, sem retry ativo)
-    //    Ocorre quando o worker reiniciou depois do horário agendado.
-    //    Fora da janela de lookahead e sem retry_until definido = nunca seriam pegos.
-    supabase
-      .from("schedules")
-      .select("id, next_run_at, cron_expression")
-      .eq("is_active", true)
-      .is("retry_until", null)
-      .lt("next_run_at", nowISO),
   ]);
 
-  // Processa retries expirados
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando para próxima semana.`);
@@ -936,14 +922,12 @@ async function reloadSchedules(): Promise<void> {
     })
   );
 
-  // Agenda schedules futuros normais
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
       scheduleTimer(s.id, s.next_run_at);
     }
   }
 
-  // Dispara retries que estão devidos
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
     if (isRetryDue(schedule, now) && !scheduledTimers.has(schedule.id)) {
@@ -952,22 +936,6 @@ async function reloadSchedules(): Promise<void> {
         console.error(`[reload] Erro no retry do schedule ${schedule.id}:`, err)
       );
     }
-  }
-
-  // ← FIX v5: Dispara schedules perdidos que estavam presos no passado
-  for (const s of missedSchedules ?? []) {
-    // Ignora se já tem um timer pendente ou se já foi pego pelo bloco de futuros
-    if (scheduledTimers.has(s.id)) continue;
-
-    const lagMs = now.getTime() - new Date(s.next_run_at).getTime();
-    console.warn(
-      `[reload] ⚠ Schedule ${s.id} estava preso no passado ` +
-      `(next_run_at: ${s.next_run_at}, atraso: ${Math.round(lagMs / 1000)}s) — disparando agora.`
-    );
-
-    fireSchedule(s.id).catch((err) =>
-      console.error(`[reload] Erro ao disparar schedule perdido ${s.id}:`, err)
-    );
   }
 }
 
@@ -1149,82 +1117,6 @@ const httpServer = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, members);
     } catch (err: any) {
       console.error("[http] /chat-members erro:", err.message);
-      return jsonResponse(res, 500, { error: err.message });
-    }
-  }
-
-  // GET /accounts/:id/dialogs
-  const dialogsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/dialogs$/);
-  if (req.method === "GET" && dialogsMatch) {
-    const accountId = dialogsMatch[1];
-    const account   = accountCache.get(accountId);
-
-    if (!account) {
-      return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
-    }
-
-    try {
-      const client  = await clientPool.get(account);
-      const dialogs = await client.getDialogs({ limit: 200 });
-      const result  = dialogs
-        .filter((d) => d.isGroup || d.isChannel)
-        .map((d) => ({
-          id:         String(d.id),
-          name:       d.title ?? d.name ?? "Sem nome",
-          type:       d.isChannel ? "channel" : "group",
-          accessHash: null,
-          members:    (d.entity as any)?.participantsCount ?? null,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      return jsonResponse(res, 200, result);
-    } catch (err: any) {
-      console.error("[http] /dialogs erro:", err.message);
-      return jsonResponse(res, 500, { error: err.message });
-    }
-  }
-
-  // GET /accounts/:id/chat-count?chat_id=XXXX
-  const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
-  if (req.method === "GET" && chatCountMatch) {
-    const accountId = chatCountMatch[1];
-    const chatId    = url.searchParams.get("chat_id");
-    const account   = accountCache.get(accountId);
-
-    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
-    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
-
-    try {
-      const client = await clientPool.get(account);
-      const rawId  = chatId.replace(/^-/, "");
-      let count: number | null = null;
-
-      const dialogs = await client.getDialogs({ limit: 500 });
-      const dialog  = dialogs.find((d) => {
-        const dId = String(d.id);
-        return dId === rawId || dId === chatId || `-${dId}` === chatId || `-100${dId}` === chatId;
-      });
-
-      if (dialog?.entity) {
-        const entity = dialog.entity as any;
-        if (entity.participantsCount != null) {
-          count = entity.participantsCount;
-        } else if (entity.className === "Channel") {
-          const full = await client.invoke(
-            new Api.channels.GetFullChannel({ channel: entity })
-          ) as any;
-          count = full.fullChat?.participantsCount ?? null;
-        } else if (entity.className === "Chat") {
-          const full = await client.invoke(
-            new Api.messages.GetFullChat({ chatId: entity.id })
-          ) as any;
-          count = full.fullChat?.participants?.participants?.length ?? null;
-        }
-      }
-
-      return jsonResponse(res, 200, { count });
-    } catch (err: any) {
-      console.error("[http] /chat-count erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
