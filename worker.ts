@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
+// v5 — missed-schedule recovery: dispara schedules presos no passado após restart
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -192,7 +192,7 @@ class TelegramClientPool {
 
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
-    const sessionInUse   = this.sessions.get(account.id);
+    const sessionInUse   = new Map(this.sessions).get(account.id);
     const sessionChanged = sessionInUse !== account.session_string;
 
     if (existing?.connected && !sessionChanged) return existing;
@@ -495,13 +495,11 @@ async function processMembersOf(
   const results: MemberResult[] = [];
 
   if (group.group_type === "closed") {
-    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
     for (const member of members) {
       const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
       results.push(result);
     }
   } else {
-    // Grupo aberto: paralelismo mantido
     const parallel = await Promise.all(
       members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
     );
@@ -516,8 +514,8 @@ async function waitForAdminSignal(
   telegramChatId: string,
   timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
-  const deadline      = Date.now() + timeoutMs;
-  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
+  const deadline  = Date.now() + timeoutMs;
+  const startUnix = Math.floor((Date.now() - 5_000) / 1000);
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -869,7 +867,9 @@ async function reloadSchedules(): Promise<void> {
     { data: futureSchedules },
     { data: retrySchedules  },
     { data: expiredRetries  },
+    { data: missedSchedules }, // ← v5: schedules que ficaram presos no passado
   ] = await Promise.all([
+    // 1. Schedules normais dentro da janela de lookahead
     supabase
       .from("schedules")
       .select("id, next_run_at")
@@ -877,6 +877,7 @@ async function reloadSchedules(): Promise<void> {
       .is("retry_until", null)
       .lte("next_run_at", lookaheadISO),
 
+    // 2. Schedules em retry ainda dentro do prazo
     supabase
       .from("schedules")
       .select(`
@@ -891,14 +892,26 @@ async function reloadSchedules(): Promise<void> {
       .not("retry_until", "is", null)
       .gt("retry_until", nowISO),
 
+    // 3. Schedules em retry expirados — avança para próxima semana
     supabase
       .from("schedules")
       .select("id, cron_expression")
       .eq("is_active", true)
       .not("retry_until", "is", null)
       .lte("retry_until", nowISO),
+
+    // 4. ← FIX v5: Schedules perdidos (next_run_at no passado, sem retry ativo)
+    //    Ocorre quando o worker reiniciou depois do horário agendado.
+    //    Fora da janela de lookahead e sem retry_until definido = nunca seriam pegos.
+    supabase
+      .from("schedules")
+      .select("id, next_run_at, cron_expression")
+      .eq("is_active", true)
+      .is("retry_until", null)
+      .lt("next_run_at", nowISO),
   ]);
 
+  // Processa retries expirados
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando para próxima semana.`);
@@ -922,12 +935,14 @@ async function reloadSchedules(): Promise<void> {
     })
   );
 
+  // Agenda schedules futuros normais
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
       scheduleTimer(s.id, s.next_run_at);
     }
   }
 
+  // Dispara retries que estão devidos
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
     if (isRetryDue(schedule, now) && !scheduledTimers.has(schedule.id)) {
@@ -936,6 +951,22 @@ async function reloadSchedules(): Promise<void> {
         console.error(`[reload] Erro no retry do schedule ${schedule.id}:`, err)
       );
     }
+  }
+
+  // ← FIX v5: Dispara schedules perdidos que estavam presos no passado
+  for (const s of missedSchedules ?? []) {
+    // Ignora se já tem um timer pendente ou se já foi pego pelo bloco de futuros
+    if (scheduledTimers.has(s.id)) continue;
+
+    const lagMs = now.getTime() - new Date(s.next_run_at).getTime();
+    console.warn(
+      `[reload] ⚠ Schedule ${s.id} estava preso no passado ` +
+      `(next_run_at: ${s.next_run_at}, atraso: ${Math.round(lagMs / 1000)}s) — disparando agora.`
+    );
+
+    fireSchedule(s.id).catch((err) =>
+      console.error(`[reload] Erro ao disparar schedule perdido ${s.id}:`, err)
+    );
   }
 }
 
