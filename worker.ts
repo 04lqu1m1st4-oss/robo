@@ -236,12 +236,12 @@ class TelegramClientPool {
 
       await client.connect();
 
-      try {
-        await client.getDialogs({ limit: 100 });
+      // Sincroniza dialogs EM BACKGROUND — não bloqueia o envio
+      client.getDialogs({ limit: 100 }).then(() => {
         console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
-      } catch (err: any) {
+      }).catch((err: any) => {
         console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
-      }
+      });
 
       this.clients.set(account.id, client);
       this.sessions.set(account.id, account.session_string);
