@@ -570,7 +570,7 @@ async function waitForAdminSignal(
       ) as any;
 
       const recentMsgs: any[] = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId);
+        .filter((m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId);
 
       if (recentMsgs.length > 0) {
         lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
@@ -578,7 +578,7 @@ async function waitForAdminSignal(
 
       const signal = recentMsgs.some((m: any) => {
         const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
-        const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+        const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
         return isOk || isMedia;
       });
 
@@ -763,7 +763,7 @@ function startScheduledGroupListener(
           ) as any;
 
           const recentMsgs: any[] = (result.messages ?? []).filter(
-            (m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId
+            (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
           );
           if (recentMsgs.length > 0) {
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
@@ -772,7 +772,7 @@ function startScheduledGroupListener(
           const gotSignal = recentMsgs.some((m: any) => {
             const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
             const isOk    = text === "ok";
-            const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+            const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
             return isOk || isMedia;
           });
 
@@ -1606,7 +1606,7 @@ const httpServer = http.createServer(async (req, res) => {
               ) as any;
 
               const recentMsgs = (result.messages ?? []).filter(
-                (m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId
+                (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
               );
 
               if (recentMsgs.length > 0) {
@@ -1616,7 +1616,7 @@ const httpServer = http.createServer(async (req, res) => {
               const gotSignal = recentMsgs.some((m: any) => {
                 const text   = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
                 const isOk   = text === "ok";
-                const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+                const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
                 return isOk || isMedia;
               });
 
