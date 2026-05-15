@@ -542,8 +542,12 @@ async function waitForAdminSignal(
   telegramChatId: string,
   timeoutMs: number = 30 * 60_000
 ): Promise<boolean> {
-  const deadline      = Date.now() + timeoutMs;
-  const startUnix     = Math.floor((Date.now() - 5_000) / 1000);
+  const deadline    = Date.now() + timeoutMs;
+  const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
+  let lastSeenMsgId = 0;
+
+  // Pre-aquece o peer antes de entrar no loop
+  try { await getOrResolvePeer(client, telegramChatId); } catch {}
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
@@ -554,7 +558,7 @@ async function waitForAdminSignal(
       const result = await client.invoke(
         new Api.messages.GetHistory({
           peer:       peer as any,
-          limit:      20,
+          limit:      10,
           offsetDate: 0,
           offsetId:   0,
           maxId:      0,
@@ -565,7 +569,11 @@ async function waitForAdminSignal(
       ) as any;
 
       const recentMsgs: any[] = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && m.date >= startUnix);
+        .filter((m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId);
+
+      if (recentMsgs.length > 0) {
+        lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
+      }
 
       const signal = recentMsgs.some((m: any) => {
         const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
@@ -581,7 +589,7 @@ async function waitForAdminSignal(
       console.warn(`[admin-signal] Erro ao buscar histórico: ${err.message}`);
     }
 
-    await new Promise((r) => setTimeout(r, MONITOR_POLL_MS));
+    await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
   }
 
   console.warn(`[admin-signal] Timeout — nenhum sinal do admin em ${telegramChatId}`);
@@ -1100,14 +1108,18 @@ const httpServer = http.createServer(async (req, res) => {
       }
 
       // Estratégia 2: dialog já carregado tem participants_count
+      // Normaliza IDs para comparação: tira prefixo -100 e sinal negativo
       if (count === null) {
         try {
           const dialogs = await client.getDialogs({ limit: 500 });
+          const absRaw  = rawId.replace(/^100/, ""); // ex: "5089055638" → "5089055638"
           const dialog  = dialogs.find((d) => {
-            const dId = String(d.id);
-            return dId === rawId || dId === chatId ||
-                   dId === rawId.replace(/^100/, "") ||
-                   `-100${dId}` === chatId;
+            const dIdStr = String(d.id).replace(/^-/, ""); // remove sinal negativo do gramjs
+            return dIdStr === rawId ||
+                   dIdStr === absRaw ||
+                   String(d.id) === chatId ||
+                   `-100${dIdStr}` === chatId ||
+                   `-${dIdStr}` === chatId;
           });
           if (dialog?.entity) {
             const ent = dialog.entity as any;
@@ -1116,20 +1128,37 @@ const httpServer = http.createServer(async (req, res) => {
               console.log(`[chat-count] ✓ dialog.entity.participantsCount: ${chatId} → ${count}`);
             }
           }
+          // Para grupos comuns o gramjs expõe dialog.inputEntity direto
+          if (count === null && dialog) {
+            const participants = (dialog as any).participantsCount;
+            if (typeof participants === "number") {
+              count = participants;
+              console.log(`[chat-count] ✓ dialog.participantsCount: ${chatId} → ${count}`);
+            }
+          }
         } catch (e2: any) {
           console.warn(`[chat-count] dialog fallback falhou para ${chatId}: ${e2.message}`);
         }
       }
 
-      // Estratégia 3: GetFullChat para grupos comuns
+      // Estratégia 3: GetFullChat para grupos comuns (usa ID positivo sem prefixo -100)
       if (count === null) {
         try {
-          const numericId = bigInt(rawId);
+          // Para grupos comuns o chatId é o número positivo sem prefixo
+          const absId     = rawId.replace(/^100/, "");
+          const numericId = bigInt(absId);
           const full      = await client.invoke(new Api.messages.GetFullChat({ chatId: numericId })) as any;
-          const parts     = full?.fullChat?.participants;
-          if (parts?.participants) {
-            count = parts.participants.length;
-            console.log(`[chat-count] ✓ GetFullChat.participants: ${chatId} → ${count}`);
+          // GetFullChat retorna participantsCount direto em fullChat
+          if (typeof full?.fullChat?.participantsCount === "number") {
+            count = full.fullChat.participantsCount;
+            console.log(`[chat-count] ✓ GetFullChat.participantsCount: ${chatId} → ${count}`);
+          } else {
+            // fallback: conta manualmente os participantes
+            const parts = full?.fullChat?.participants;
+            if (parts?.participants) {
+              count = parts.participants.length;
+              console.log(`[chat-count] ✓ GetFullChat.participants.length: ${chatId} → ${count}`);
+            }
           }
         } catch (e3: any) {
           console.warn(`[chat-count] GetFullChat falhou para ${chatId}: ${e3.message}`);
