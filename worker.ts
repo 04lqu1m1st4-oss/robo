@@ -22,7 +22,8 @@ const KEEPALIVE_INTERVAL_MS  = 45_000;
 // Monitoramento de posição
 const MONITOR_DELAY_CLOSED_MS = 6_000;
 const MONITOR_MAX_OPEN_MS     = 5 * 60_000;
-const MONITOR_POLL_MS         = 5_000;
+const MONITOR_POLL_MS         = 5_000;   // monitor de posições (pode ser lento)
+const LISTEN_POLL_MS          = 400;     // poll do listener de admin — agressivo
 const MONITOR_HISTORY_LIMIT   = 150;
 
 /* ─── Tipos ─── */
@@ -1260,6 +1261,188 @@ const httpServer = http.createServer(async (req, res) => {
     } catch (err: any) {
       console.error("[http] /reload erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // ── POST/DELETE /groups/:id/listen ─────────────────────────────────────
+  // Aciona a escuta manual de grupo aberto (botão "Aguardar OK da admin").
+  // POST  — inicia escuta assíncrona; quando admin enviar "ok", dispara o grupo.
+  // DELETE — cancela a escuta em andamento.
+  const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
+
+  const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
+  if (listenMatch) {
+    const groupId = listenMatch[1];
+
+    if (req.method === "DELETE") {
+      const ctrl = listenMap.get(groupId);
+      if (ctrl) {
+        ctrl.abort();
+        listenMap.delete(groupId);
+        console.log(`[listen] ⏹ Escuta cancelada para grupo ${groupId}`);
+      }
+      return jsonResponse(res, 200, { ok: true });
+    }
+
+    if (req.method === "POST") {
+      // Cancela escuta anterior se houver
+      const existing = listenMap.get(groupId);
+      if (existing) existing.abort();
+
+      const ctrl = new AbortController();
+      listenMap.set(groupId, ctrl);
+
+      // Executa em background — não bloqueia a resposta HTTP
+      (async () => {
+        try {
+          const { data: grpRow } = await supabase
+            .from("groups")
+            .select(`
+              id, telegram_chat_id, group_type,
+              group_members(id, message_text, position, is_active,
+                accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
+            `)
+            .eq("id", groupId)
+            .single();
+
+          if (!grpRow) {
+            console.warn(`[listen] Grupo ${groupId} não encontrado`);
+            return;
+          }
+
+          const chatId    = String(grpRow.telegram_chat_id);
+          const members   = (grpRow.group_members ?? []) as GroupMember[];
+          const firstMember = members.find((m) => m.is_active && m.accounts?.is_active);
+
+          if (!firstMember?.accounts) {
+            console.warn(`[listen] Nenhuma conta ativa no grupo ${groupId}`);
+            return;
+          }
+
+          const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
+          const client  = await clientPool.get(account);
+
+          // Timeout de 2h para escuta manual
+          const MANUAL_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
+          const deadline  = Date.now() + MANUAL_LISTEN_TIMEOUT_MS;
+          // Guarda o unix timestamp DO INÍCIO da escuta — aceita mensagens de até
+          // 10s antes para não perder o sinal se a conexão demorou a subir
+          const startUnix = Math.floor((Date.now() - 10_000) / 1000);
+          // lastSeenMsgId: evita reagir à mesma mensagem duas vezes
+          let lastSeenMsgId = 0;
+
+          // Pre-aquece o peer antes de entrar no loop (evita latência na 1ª poll)
+          try { await getOrResolvePeer(client, chatId); } catch {}
+
+          console.log(`[listen] 👂 Aguardando OK da admin em ${chatId} (grupo ${groupId})`);
+
+          while (Date.now() < deadline && !ctrl.signal.aborted) {
+            try {
+              const peer   = await getOrResolvePeer(client, chatId);
+              const result = await client.invoke(
+                new Api.messages.GetHistory({
+                  peer: peer as any, limit: 10,
+                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+                  hash: bigInt(0), addOffset: 0,
+                })
+              ) as any;
+
+              const recentMsgs = (result.messages ?? []).filter(
+                (m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId
+              );
+
+              if (recentMsgs.length > 0) {
+                lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
+              }
+
+              const gotSignal = recentMsgs.some((m: any) => {
+                const text   = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
+                const isOk   = text === "ok";
+                const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+                return isOk || isMedia;
+              });
+
+              if (gotSignal && !ctrl.signal.aborted) {
+                console.log(`[listen] ✓ Sinal da admin detectado para grupo ${groupId} — disparando`);
+                listenMap.delete(groupId);
+
+                await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
+
+                // Busca user_id, name e telegram_chat_name para o log
+                const { data: grpFull } = await supabase
+                  .from("groups")
+                  .select("name, telegram_chat_name, user_id")
+                  .eq("id", groupId)
+                  .single();
+
+                const scheduleStub = {
+                  id:                         `manual-${groupId}-${Date.now()}`,
+                  user_id:                    grpFull?.user_id ?? "",
+                  group_id:                   groupId,
+                  cron_expression:            "0 0 * * 0",
+                  next_run_at:                new Date().toISOString(),
+                  retry_window_seconds:       60,
+                  retry_interval_seconds:     5,
+                  retry_interval_max_seconds: 30,
+                  retry_count:                0,
+                  retry_until:                null,
+                  last_attempt_at:            null,
+                  groups: {
+                    id:                 groupId,
+                    name:               grpFull?.name ?? groupId,
+                    telegram_chat_id:   chatId,
+                    telegram_chat_name: grpFull?.telegram_chat_name ?? null,
+                    group_type:         "open" as const,
+                    group_members:      members,
+                  },
+                };
+
+                const dispatchedAt = new Date();
+                const alreadySent  = new Set<string>();
+                const results      = await processMembersOf(scheduleStub as any, alreadySent);
+
+                const sentForMonitor = results
+                  .filter((r) => r.status === "sent")
+                  .map((r) => {
+                    const member = members.find((m) => m.accounts?.id === r.account_id);
+                    return { account_id: r.account_id, message_text: member?.message_text ?? "" };
+                  })
+                  .filter((r) => r.message_text);
+
+                if (sentForMonitor.length > 0) {
+                  monitorPositions(chatId, sentForMonitor, scheduleStub.id, dispatchedAt, "open")
+                    .catch((err) => console.error("[listen] Erro no monitoramento:", err.message));
+                }
+
+                const sent = results.filter((r) => r.status === "sent").length;
+                console.log(`[listen] ✓ Disparo manual concluído para grupo ${groupId}: ${sent} enviadas`);
+                return;
+              }
+            } catch (err: any) {
+              if (!ctrl.signal.aborted) {
+                console.warn(`[listen] Erro ao buscar histórico para ${groupId}: ${err.message}`);
+              }
+            }
+
+            if (!ctrl.signal.aborted) {
+              await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
+            }
+          }
+
+          if (ctrl.signal.aborted) {
+            console.log(`[listen] ⏹ Escuta abortada para grupo ${groupId}`);
+          } else {
+            console.warn(`[listen] ⏰ Timeout — nenhum OK recebido para grupo ${groupId}`);
+            await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
+          }
+          listenMap.delete(groupId);
+        } catch (err: any) {
+          console.error(`[listen] Erro inesperado para grupo ${groupId}:`, err.message);
+          listenMap.delete(groupId);
+        }
+      })();
+
+      return jsonResponse(res, 200, { ok: true });
     }
   }
 
