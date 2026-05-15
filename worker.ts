@@ -80,18 +80,21 @@ const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
 
 /* ─── Resolve peer com múltiplos fallbacks ─── */
+// peerCache: chave = "accountId:chatId" — accessHash é específico por conta
 async function getOrResolvePeer(
   client: TelegramClient,
-  telegramChatId: string
+  telegramChatId: string,
+  accountId: string
 ): Promise<unknown> {
-  if (peerCache.has(telegramChatId)) return peerCache.get(telegramChatId)!;
+  const cacheKey = `${accountId}:${telegramChatId}`;
+  if (peerCache.has(cacheKey)) return peerCache.get(cacheKey)!;
 
   const chatIdNum = parseInt(telegramChatId, 10);
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
   try {
     const peer = await client.getInputEntity(chatIdNum);
-    peerCache.set(telegramChatId, peer);
+    peerCache.set(cacheKey, peer);
     console.log(`[peer] ✓ getInputEntity: ${telegramChatId}`);
     return peer;
   } catch (e1: any) {
@@ -119,7 +122,7 @@ async function getOrResolvePeer(
         channelId: chat.id,
         accessHash: chat.accessHash,
       });
-      peerCache.set(telegramChatId, peer);
+      peerCache.set(cacheKey, peer);
       console.log(`[peer] ✓ GetChannels MTProto: ${telegramChatId}`);
       return peer;
     }
@@ -131,7 +134,7 @@ async function getOrResolvePeer(
     console.warn(`[peer] Sincronizando dialogs para resolver ${telegramChatId}...`);
     await client.getDialogs({ limit: 200 });
     const peer = await client.getInputEntity(chatIdNum);
-    peerCache.set(telegramChatId, peer);
+    peerCache.set(cacheKey, peer);
     console.log(`[peer] ✓ Resolvido após GetDialogs: ${telegramChatId}`);
     return peer;
   } catch (e3: any) {
@@ -394,7 +397,7 @@ async function sendAggressively(
     try {
       await Promise.race([
         (async () => {
-          const peer = await getOrResolvePeer(client, telegramChatId);
+          const peer = await getOrResolvePeer(client, telegramChatId, account.id);
           try {
             await client.sendMessage(peer as any, { message: messageText });
           } catch (err: any) {
@@ -406,7 +409,7 @@ async function sendAggressively(
               errMsg.includes("CHANNEL_PRIVATE")
             ) {
               console.warn(`[peer] Cache inválido para ${telegramChatId} — limpando`);
-              peerCache.delete(telegramChatId);
+              peerCache.delete(`${account.id}:${telegramChatId}`);
             }
 
             const isFlood =
@@ -424,8 +427,8 @@ async function sendAggressively(
 
               if (waitMs < budgetEnd - Date.now() - 500) {
                 await new Promise((r) => setTimeout(r, waitMs));
-                peerCache.delete(telegramChatId);
-                const freshPeer = await getOrResolvePeer(client, telegramChatId);
+                peerCache.delete(`${account.id}:${telegramChatId}`);
+                const freshPeer = await getOrResolvePeer(client, telegramChatId, account.id);
                 await client.sendMessage(freshPeer as any, { message: messageText });
                 return;
               }
@@ -548,13 +551,13 @@ async function waitForAdminSignal(
   let lastSeenMsgId = 0;
 
   // Pre-aquece o peer antes de entrar no loop
-  try { await getOrResolvePeer(client, telegramChatId); } catch {}
+  try { await getOrResolvePeer(client, telegramChatId, client.session.toString()); } catch {}
 
   console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
 
   while (Date.now() < deadline) {
     try {
-      const peer = await getOrResolvePeer(client, telegramChatId);
+      const peer = await getOrResolvePeer(client, telegramChatId, client.session.toString());
 
       const result = await client.invoke(
         new Api.messages.GetHistory({
@@ -630,7 +633,7 @@ async function monitorPositions(
 
   while (Date.now() < deadline) {
     try {
-      const peer = await getOrResolvePeer(client, telegramChatId);
+      const peer = await getOrResolvePeer(client, telegramChatId, account.id);
 
       const result = await client.invoke(
         new Api.messages.GetHistory({
@@ -742,7 +745,7 @@ function startScheduledGroupListener(
       }
 
       // Pre-aquece peer
-      try { await getOrResolvePeer(client, chatId); } catch {}
+      try { await getOrResolvePeer(client, chatId, account.id); } catch {}
 
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         try {
@@ -750,10 +753,10 @@ function startScheduledGroupListener(
           if (!client.connected) {
             console.warn(`[schedule-listen] Client desconectado — reconectando para ${scheduleId}`);
             client = await clientPool.get(account);
-            try { await getOrResolvePeer(client, chatId); } catch {}
+            try { await getOrResolvePeer(client, chatId, account.id); } catch {}
           }
 
-          const peer   = await getOrResolvePeer(client, chatId);
+          const peer   = await getOrResolvePeer(client, chatId, account.id);
           const result = await client.invoke(
             new Api.messages.GetHistory({
               peer: peer as any, limit: 10,
@@ -1590,13 +1593,13 @@ const httpServer = http.createServer(async (req, res) => {
           let lastSeenMsgId = 0;
 
           // Pre-aquece o peer antes de entrar no loop (evita latência na 1ª poll)
-          try { await getOrResolvePeer(client, chatId); } catch {}
+          try { await getOrResolvePeer(client, chatId, account.id); } catch {}
 
           console.log(`[listen] 👂 Aguardando OK da admin em ${chatId} (grupo ${groupId})`);
 
           while (Date.now() < deadline && !ctrl.signal.aborted) {
             try {
-              const peer   = await getOrResolvePeer(client, chatId);
+              const peer   = await getOrResolvePeer(client, chatId, account.id);
               const result = await client.invoke(
                 new Api.messages.GetHistory({
                   peer: peer as any, limit: 10,
