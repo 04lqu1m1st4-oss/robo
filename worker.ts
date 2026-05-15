@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v4 — receiveUpdates: false (para o _updateLoop que causava TIMEOUT spam)
+// v5 — adiciona /chat-count + /accounts/:id/reload; reforça anti-AUTH_KEY_DUPLICATED
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -197,8 +197,13 @@ class TelegramClientPool {
 
     if (existing?.connected && !sessionChanged) return existing;
 
+    // Se já tem uma conexão em andamento, aguarda ela em vez de criar outra
+    // (isso evita AUTH_KEY_DUPLICATED por corridas de conexão paralela)
     const inflight = this.connectingPromises.get(account.id);
-    if (inflight) return inflight;
+    if (inflight) {
+      console.log(`[pool] Aguardando conexão em andamento para ${account.phone_number}...`);
+      return inflight;
+    }
 
     const connectPromise = (async () => {
       if (existing) {
@@ -223,6 +228,7 @@ class TelegramClientPool {
         }
       );
 
+      // Desativa o loop de updates para evitar conflito com outra sessão ativa
       (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
@@ -247,6 +253,17 @@ class TelegramClientPool {
     } finally {
       this.connectingPromises.delete(account.id);
     }
+  }
+
+  /** Reconecta uma conta específica (chamado pelo endpoint /reload). */
+  async reload(account: Account): Promise<TelegramClient> {
+    const existing = this.clients.get(account.id);
+    if (existing) {
+      try { await existing.disconnect(); } catch {}
+      this._evict(account.id);
+    }
+    this.connectingPromises.delete(account.id);
+    return this.get(account);
   }
 
   async prewarm(accounts: Account[]): Promise<void> {
@@ -986,7 +1003,8 @@ async function prewarmAccounts(): Promise<void> {
    Rotas:
      GET  /accounts/:id/chats
      GET  /accounts/:id/chat-members?chat_id=XXXX
-     POST /accounts/:id/reload        ← NOVO: força reload de uma conta no cache
+     GET  /accounts/:id/chat-count?chat_id=XXXX      ← NOVO
+     POST /accounts/:id/reload                        ← NOVO
 
    Protegido por WORKER_SECRET (header x-worker-secret).
    ─────────────────────────────────────────────────────────────────────────── */
@@ -1037,7 +1055,86 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── GET /accounts/:id/chat-members?chat_id=XXXX ──────────────────────────
+  // ── GET /accounts/:id/chat-count?chat_id=XXXX ───────────────────────────
+  const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
+  if (req.method === "GET" && chatCountMatch) {
+    const accountId = chatCountMatch[1];
+    const chatId    = url.searchParams.get("chat_id");
+    const account   = accountCache.get(accountId);
+
+    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+
+    try {
+      const client = await clientPool.get(account);
+      const rawId  = chatId.replace(/^-100/, "").replace(/^-/, "");
+      let count: number | null = null;
+
+      // Estratégia 1: GetFullChannel para supergrupos/canais
+      try {
+        const channelId = bigInt(rawId);
+        const result = await client.invoke(
+          new Api.channels.GetFullChannel({
+            channel: new Api.InputChannel({
+              channelId,
+              accessHash: bigInt(0),
+            }),
+          })
+        ) as any;
+        const participantsCount = result?.fullChat?.participantsCount;
+        if (typeof participantsCount === "number") {
+          count = participantsCount;
+          console.log(`[chat-count] ✓ GetFullChannel: ${chatId} → ${count}`);
+        }
+      } catch (e1: any) {
+        console.warn(`[chat-count] GetFullChannel falhou para ${chatId}: ${e1.message}`);
+      }
+
+      // Estratégia 2: dialog já carregado tem participants_count
+      if (count === null) {
+        try {
+          const dialogs = await client.getDialogs({ limit: 500 });
+          const dialog  = dialogs.find((d) => {
+            const dId = String(d.id);
+            return dId === rawId || dId === chatId ||
+                   dId === rawId.replace(/^100/, "") ||
+                   `-100${dId}` === chatId;
+          });
+          if (dialog?.entity) {
+            const ent = dialog.entity as any;
+            if (typeof ent.participantsCount === "number") {
+              count = ent.participantsCount;
+              console.log(`[chat-count] ✓ dialog.entity.participantsCount: ${chatId} → ${count}`);
+            }
+          }
+        } catch (e2: any) {
+          console.warn(`[chat-count] dialog fallback falhou para ${chatId}: ${e2.message}`);
+        }
+      }
+
+      // Estratégia 3: GetFullChat para grupos comuns
+      if (count === null) {
+        try {
+          const numericId = bigInt(rawId);
+          const full      = await client.invoke(new Api.messages.GetFullChat({ chatId: numericId })) as any;
+          const parts     = full?.fullChat?.participants;
+          if (parts?.participants) {
+            count = parts.participants.length;
+            console.log(`[chat-count] ✓ GetFullChat.participants: ${chatId} → ${count}`);
+          }
+        } catch (e3: any) {
+          console.warn(`[chat-count] GetFullChat falhou para ${chatId}: ${e3.message}`);
+        }
+      }
+
+      return jsonResponse(res, 200, { count });
+    } catch (err: any) {
+      console.error("[http] /chat-count erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
+  // ── GET /accounts/:id/chat-members?chat_id=XXXX ─────────────────────────
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const accountId = membersMatch[1];
@@ -1122,35 +1219,35 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /accounts/:id/reload ─────────────────────────────────────────────
-  // Força o worker a buscar a conta no banco e adicioná-la ao cache/pool.
-  // Necessário para contas adicionadas após o boot do worker.
+  // ── POST /accounts/:id/reload ────────────────────────────────────────────
+  // Força o worker a reconectar uma conta específica no pool.
+  // Chamado pelo Next.js após autenticar uma conta nova para evitar
+  // que o pool tente criar uma segunda sessão e cause AUTH_KEY_DUPLICATED.
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
 
+    // Busca conta no banco para ter a session_string mais recente
+    const { data: row, error } = await supabase
+      .from("accounts")
+      .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+      .eq("id", accountId)
+      .single();
+
+    if (error || !row) {
+      return jsonResponse(res, 404, { error: "Conta não encontrada" });
+    }
+
+    const account = row as Account;
+    accountCache.set(accountId, account);
+
+    if (!account.is_active || !account.session_string) {
+      return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa ou sem sessão" });
+    }
+
     try {
-      const { data, error } = await supabase
-        .from("accounts")
-        .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
-        .eq("id", accountId)
-        .single();
-
-      if (error || !data) {
-        return jsonResponse(res, 404, { error: "Conta não encontrada no banco" });
-      }
-
-      const account = data as Account;
-
-      // Atualiza o cache mesmo que a conta já estivesse lá
-      accountCache.set(accountId, account);
-
-      // Se tem sessão ativa, conecta no pool (ou reconecta se sessão mudou)
-      if (account.session_string && account.is_active) {
-        await clientPool.get(account);
-      }
-
-      console.log(`[http] /reload: conta ${account.phone_number} recarregada no cache`);
+      await clientPool.reload(account);
+      console.log(`[http] /reload ✓ conta ${account.phone_number} recarregada no pool`);
       return jsonResponse(res, 200, { ok: true });
     } catch (err: any) {
       console.error("[http] /reload erro:", err.message);
