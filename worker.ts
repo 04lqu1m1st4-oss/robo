@@ -44,7 +44,9 @@ interface GroupMember {
 }
 interface Group {
   id: string;
+  name: string;
   telegram_chat_id: string | null;
+  telegram_chat_name: string | null;
   group_type: "open" | "closed";
   group_members: GroupMember[];
 }
@@ -65,6 +67,7 @@ interface Schedule {
 interface MemberResult {
   member_id: string;
   account_id: string;
+  position_rank: number;
   status: "sent" | "failed" | "skipped";
   retryable: boolean;
   error?: string;
@@ -458,11 +461,12 @@ async function trySendMember(
   account: Account,
   group: Group,
   schedule: Schedule,
-  alreadySent: Set<string>
+  alreadySent: Set<string>,
+  positionRank: number
 ): Promise<MemberResult> {
   if (alreadySent.has(account.id)) {
     console.log(`[worker] ↷ ${member.id} (${account.phone_number}) — já enviou neste ciclo [mem]`);
-    return { member_id: member.id, account_id: account.id, status: "skipped", retryable: false };
+    return { member_id: member.id, account_id: account.id, position_rank: positionRank, status: "skipped", retryable: false };
   }
 
   let logStatus: "sent" | "failed" = "failed";
@@ -485,17 +489,20 @@ async function trySendMember(
   }
 
   await supabase.from("dispatch_logs").insert({
-    user_id:       schedule.user_id,
-    group_id:      group.id,
-    account_id:    account.id,
-    schedule_id:   schedule.id,
-    status:        logStatus,
-    message_text:  member.message_text,
-    sent_at:       logStatus === "sent" ? new Date().toISOString() : null,
-    error_message: errorMsg ?? null,
+    user_id:             schedule.user_id,
+    group_id:            group.id,
+    account_id:          account.id,
+    schedule_id:         schedule.id,
+    status:              logStatus,
+    message_text:        member.message_text,
+    position_rank:       positionRank,
+    group_name_snapshot: group.name,
+    chat_name_snapshot:  group.telegram_chat_name,
+    sent_at:             logStatus === "sent" ? new Date().toISOString() : null,
+    error_message:       errorMsg ?? null,
   });
 
-  return { member_id: member.id, account_id: account.id, status: logStatus, retryable, error: errorMsg };
+  return { member_id: member.id, account_id: account.id, position_rank: positionRank, status: logStatus, retryable, error: errorMsg };
 }
 
 /* ─── Processa membros sequencialmente (evita duplicatas em grupo fechado) ─── */
@@ -513,14 +520,15 @@ async function processMembersOf(
 
   if (group.group_type === "closed") {
     // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
-    for (const member of members) {
-      const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent);
+    for (let i = 0; i < members.length; i++) {
+      const member = members[i];
+      const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent, i + 1);
       results.push(result);
     }
   } else {
     // Grupo aberto: paralelismo mantido
     const parallel = await Promise.all(
-      members.map((member) => trySendMember(member, member.accounts!, group, schedule, alreadySent))
+      members.map((member, i) => trySendMember(member, member.accounts!, group, schedule, alreadySent, i + 1))
     );
     results.push(...parallel);
   }
@@ -697,7 +705,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       id, cron_expression, user_id, group_id, next_run_at,
       retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
       retry_count, retry_until, last_attempt_at,
-      groups(id, telegram_chat_id, group_type,
+      groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
         group_members(id, message_text, position, is_active,
           accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
     `)
@@ -900,7 +908,7 @@ async function reloadSchedules(): Promise<void> {
         id, cron_expression, user_id, group_id, next_run_at,
         retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
         retry_count, retry_until, last_attempt_at,
-        groups(id, telegram_chat_id, group_type,
+        groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
           group_members(id, message_text, position, is_active,
             accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
       `)
