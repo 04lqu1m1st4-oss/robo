@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v5 — adiciona /chat-count + /accounts/:id/reload; reforça anti-AUTH_KEY_DUPLICATED
+// v6 — listener não-bloqueante para grupos abertos (schedule-driven); sobrevive a reconexões
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -20,11 +20,12 @@ const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
 
 // Monitoramento de posição
-const MONITOR_DELAY_CLOSED_MS = 6_000;
-const MONITOR_MAX_OPEN_MS     = 5 * 60_000;
-const MONITOR_POLL_MS         = 5_000;   // monitor de posições (pode ser lento)
-const LISTEN_POLL_MS          = 400;     // poll do listener de admin — agressivo
-const MONITOR_HISTORY_LIMIT   = 150;
+const MONITOR_DELAY_CLOSED_MS     = 6_000;
+const MONITOR_MAX_OPEN_MS         = 5 * 60_000;
+const MONITOR_POLL_MS             = 5_000;   // monitor de posições (pode ser lento)
+const LISTEN_POLL_MS              = 400;     // poll do listener de admin — agressivo
+const MONITOR_HISTORY_LIMIT       = 150;
+const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2h — janela máxima aguardando OK do admin
 
 /* ─── Tipos ─── */
 interface Account {
@@ -703,6 +704,192 @@ async function monitorPositions(
   console.warn(`[monitor] Timeout — posições não registradas para schedule ${scheduleId}`);
 }
 
+/* ─── Listener não-bloqueante para grupos abertos (schedule-driven) ─────────────────────
+   Inicia em background e dispara quando o admin envia qualquer mensagem (ou "ok").
+   Persiste o estado no banco (retry_until) para sobreviver a reconexões do worker.
+   ──────────────────────────────────────────────────────────────────────────── */
+function startScheduledGroupListener(
+  schedule: Schedule,
+  group: Group,
+  account: Account
+): void {
+  const groupId    = group.id;
+  const chatId     = group.telegram_chat_id!;
+  const scheduleId = schedule.id;
+  const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
+
+  // Cancela listener anterior se existir (evita duplos após reconexão)
+  const existing = listenMap.get(groupId);
+  if (existing) existing.abort();
+
+  const ctrl      = new AbortController();
+  listenMap.set(groupId, ctrl);
+
+  const deadline    = Date.now() + OPEN_GROUP_LISTEN_TIMEOUT_MS;
+  const startUnix   = Math.floor((Date.now() - 10_000) / 1000); // aceita msgs até 10s antes
+  let lastSeenMsgId = 0;
+
+  console.log(`[schedule-listen] 👂 Aguardando sinal do admin em ${chatId} para schedule ${scheduleId}`);
+
+  // Executa em background — não bloqueia o loop principal
+  (async () => {
+    try {
+      let client = await clientPool.get(account).catch(() => null);
+      if (!client) {
+        console.warn(`[schedule-listen] Sem client para ${scheduleId} — abortando listener`);
+        listenMap.delete(groupId);
+        return;
+      }
+
+      // Pre-aquece peer
+      try { await getOrResolvePeer(client, chatId); } catch {}
+
+      while (Date.now() < deadline && !ctrl.signal.aborted) {
+        try {
+          // Reconecta se desconectado
+          if (!client.connected) {
+            console.warn(`[schedule-listen] Client desconectado — reconectando para ${scheduleId}`);
+            client = await clientPool.get(account);
+            try { await getOrResolvePeer(client, chatId); } catch {}
+          }
+
+          const peer   = await getOrResolvePeer(client, chatId);
+          const result = await client.invoke(
+            new Api.messages.GetHistory({
+              peer: peer as any, limit: 10,
+              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+              hash: bigInt(0), addOffset: 0,
+            })
+          ) as any;
+
+          const recentMsgs: any[] = (result.messages ?? []).filter(
+            (m: any) => m._ === "message" && m.date >= startUnix && m.id > lastSeenMsgId
+          );
+          if (recentMsgs.length > 0) {
+            lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
+          }
+
+          const gotSignal = recentMsgs.some((m: any) => {
+            const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
+            const isOk    = text === "ok";
+            const isMedia = m.media && m.media._ !== "messageMediaEmpty" && m.media._ !== undefined;
+            return isOk || isMedia;
+          });
+
+          if (gotSignal && !ctrl.signal.aborted) {
+            console.log(`[schedule-listen] ✓ Sinal detectado — disparando schedule ${scheduleId}`);
+            listenMap.delete(groupId);
+
+            const dispatchedAt = new Date();
+            const alreadySent  = await getAlreadySentAccountIds(schedule);
+            const results      = await processMembersOf(schedule, alreadySent);
+
+            const sentForMonitor = results
+              .filter((r) => r.status === "sent")
+              .map((r) => {
+                const member = (group.group_members ?? []).find((m) => m.accounts?.id === r.account_id);
+                return { account_id: r.account_id, message_text: member?.message_text ?? "" };
+              })
+              .filter((r) => r.message_text);
+
+            if (sentForMonitor.length > 0) {
+              monitorPositions(chatId, sentForMonitor, scheduleId, dispatchedAt, "open")
+                .catch((err) => console.error("[schedule-listen] Erro no monitoramento:", err.message));
+            }
+
+            const sentCount         = results.filter((r) => r.status === "sent").length;
+            const skippedCount      = results.filter((r) => r.status === "skipped").length;
+            const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
+            const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
+            const totalDelivered    = sentCount + skippedCount;
+            const hasActiveMembers  = (group.group_members ?? []).some((m) => m.is_active && m.accounts?.is_active);
+            const allSucceeded      = hasActiveMembers && retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
+            const nowISO            = new Date().toISOString();
+
+            if (allSucceeded) {
+              let nextRun: string;
+              try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
+              catch (err) {
+                console.error(`[schedule-listen] cron inválido no schedule ${scheduleId}:`, err);
+                await supabase.from("schedules").update({ is_active: false }).eq("id", scheduleId);
+                return;
+              }
+              await supabase.from("schedules").update({
+                next_run_at:         nextRun,
+                last_run_at:         nowISO,
+                retry_until:         null,
+                retry_count:         0,
+                last_attempt_at:     nowISO,
+                last_attempt_status: "sent",
+                last_attempt_error:  null,
+              }).eq("id", scheduleId);
+              console.log(`[schedule-listen] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
+              scheduleTimer(scheduleId, nextRun);
+            } else {
+              // Falhas retryáveis — passa para o ciclo normal de retry
+              const newRetryCount  = schedule.retry_count + 1;
+              const retryUntil     = new Date(Date.now() + schedule.retry_window_seconds * 1000).toISOString();
+              const failedErrors   = results
+                .filter((r) => r.status === "failed" && r.error)
+                .map((r) => `[${r.account_id}] ${r.error}`).join("; ");
+              await supabase.from("schedules").update({
+                retry_until:         retryUntil,
+                retry_count:         newRetryCount,
+                last_attempt_at:     nowISO,
+                last_attempt_status: "retrying",
+                last_attempt_error:  failedErrors || null,
+              }).eq("id", scheduleId);
+              const intervalNext = calcRetryInterval(newRetryCount, schedule.retry_interval_seconds, schedule.retry_interval_max_seconds);
+              const retryAt = new Date(Date.now() + intervalNext * 1000);
+              if (retryAt < new Date(retryUntil)) scheduleTimer(scheduleId, retryAt.toISOString());
+            }
+            return; // listener encerrado com sucesso
+          }
+
+        } catch (err: any) {
+          if (!ctrl.signal.aborted) {
+            console.warn(`[schedule-listen] Erro ao buscar histórico (${scheduleId}): ${err.message}`);
+            // Aguarda e tenta reconectar na próxima iteração
+            await new Promise((r) => setTimeout(r, 2_000));
+          }
+        }
+
+        if (!ctrl.signal.aborted) {
+          await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
+        }
+      }
+
+      // Fora do loop — timeout ou abort
+      listenMap.delete(groupId);
+
+      if (ctrl.signal.aborted) {
+        console.log(`[schedule-listen] ⏹ Listener abortado para schedule ${scheduleId}`);
+        return;
+      }
+
+      // Timeout: avança para próxima semana sem ter disparado
+      console.warn(`[schedule-listen] ⏰ Timeout 2h — nenhum sinal do admin para schedule ${scheduleId}`);
+      const nowISO = new Date().toISOString();
+      let nextRun: string;
+      try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
+      catch { await supabase.from("schedules").update({ is_active: false }).eq("id", scheduleId); return; }
+      await supabase.from("schedules").update({
+        next_run_at:         nextRun,
+        retry_until:         null,
+        retry_count:         0,
+        last_attempt_at:     nowISO,
+        last_attempt_status: "timeout",
+        last_attempt_error:  "Timeout aguardando sinal do admin",
+      }).eq("id", scheduleId);
+      scheduleTimer(scheduleId, nextRun);
+
+    } catch (err: any) {
+      console.error(`[schedule-listen] Erro inesperado para schedule ${scheduleId}:`, err.message);
+      listenMap.delete(groupId);
+    }
+  })();
+}
+
 /* ─── Dispara um schedule ─── */
 async function fireSchedule(scheduleId: string): Promise<void> {
   const now    = new Date();
@@ -745,19 +932,38 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   console.log(`[timer] ⚡ Disparando schedule ${scheduleId} às ${nowISO}`);
 
   if (group.group_type === "open") {
-    const firstAccount = (group.group_members ?? [])
-      .find((m) => m.is_active && m.accounts?.is_active)?.accounts;
+    const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
 
-    if (firstAccount) {
-      const client = await clientPool.get(firstAccount).catch(() => null);
-      if (client) {
-        const gotSignal = await waitForAdminSignal(client, group.telegram_chat_id!);
-        if (!gotSignal) {
-          console.warn(`[timer] Schedule ${scheduleId}: timeout aguardando ok do admin — abortando ciclo.`);
-          return;
-        }
-      }
+    // Já existe listener ativo para este grupo? Evita duplicatas após reconexão
+    if (listenMap.has(group.id)) {
+      console.log(`[timer] Schedule ${scheduleId}: listener já ativo para grupo ${group.id} — ignorando`);
+      return;
     }
+
+    const firstAccount = (group.group_members ?? [])
+      .filter((m) => m.is_active && m.accounts?.is_active)
+      .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
+
+    if (!firstAccount) {
+      console.warn(`[timer] Schedule ${scheduleId}: nenhuma conta ativa no grupo — abortando.`);
+      return;
+    }
+
+    // Inicia listener não-bloqueante (retorna imediatamente)
+    startScheduledGroupListener(schedule, group, firstAccount);
+
+    // Persiste no banco que está aguardando o sinal do admin.
+    // retry_until = now + 2h garante que reloadSchedules recupere o listener
+    // caso o worker reinicie antes do admin enviar a mensagem.
+    await supabase.from("schedules").update({
+      retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
+      last_attempt_at:     nowISO,
+      last_attempt_status: "waiting_admin",
+      last_attempt_error:  null,
+    }).eq("id", scheduleId);
+
+    console.log(`[timer] 👂 Schedule ${scheduleId}: listener não-bloqueante iniciado (grupo aberto ${group.id})`);
+    return;
   }
 
   const alreadySent = await getAlreadySentAccountIds(schedule);
@@ -927,7 +1133,7 @@ async function reloadSchedules(): Promise<void> {
 
     supabase
       .from("schedules")
-      .select("id, cron_expression")
+      .select("id, cron_expression, group_id")
       .eq("is_active", true)
       .not("retry_until", "is", null)
       .lte("retry_until", nowISO),
@@ -936,6 +1142,18 @@ async function reloadSchedules(): Promise<void> {
   await Promise.all(
     (expiredRetries ?? []).map(async (expired) => {
       console.warn(`[reload] Schedule ${expired.id}: retry expirou. Avançando para próxima semana.`);
+
+      // Aborta listener ativo para este grupo (se houver)
+      const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
+      const expGroupId = (expired as any).group_id as string | undefined;
+      if (expGroupId) {
+        const ctrl = listenMap.get(expGroupId);
+        if (ctrl) {
+          ctrl.abort();
+          listenMap.delete(expGroupId);
+          console.log(`[reload] Listener abortado para grupo ${expGroupId} (schedule ${expired.id} expirou)`);
+        }
+      }
       let nextRun: string;
       try {
         nextRun = nextWeeklyOccurrence(expired.cron_expression);
@@ -964,6 +1182,13 @@ async function reloadSchedules(): Promise<void> {
 
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
+
+    // Se já existe um listener ativo para este grupo aberto, não retrigga
+    const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
+    if (listenMap.has(schedule.group_id)) {
+      continue;
+    }
+
     if (isRetryDue(schedule, now) && !scheduledTimers.has(schedule.id)) {
       console.log(`[reload] Schedule ${schedule.id} em retry — disparando agora.`);
       fireSchedule(schedule.id).catch((err) =>
