@@ -523,20 +523,12 @@ async function processMembersOf(
 
   const results: MemberResult[] = [];
 
-  if (group.group_type === "closed") {
-    // Grupo fechado: envia UM por vez em sequência para evitar duplicatas
-    for (let i = 0; i < members.length; i++) {
-      const member = members[i];
-      const result = await trySendMember(member, member.accounts!, group, schedule, alreadySent, i + 1);
-      results.push(result);
-    }
-  } else {
-    // Grupo aberto: paralelismo mantido
-    const parallel = await Promise.all(
-      members.map((member, i) => trySendMember(member, member.accounts!, group, schedule, alreadySent, i + 1))
-    );
-    results.push(...parallel);
-  }
+  // Paralelismo total — grupos fechados e abertos disparam ao mesmo tempo
+  // Membros do mesmo chat competem entre si, mas todos chegam o mais rápido possível
+  const parallel = await Promise.all(
+    members.map((member, i) => trySendMember(member, member.accounts!, group, schedule, alreadySent, i + 1))
+  );
+  results.push(...parallel);
 
   return results;
 }
