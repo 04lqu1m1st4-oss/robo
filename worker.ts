@@ -1310,8 +1310,12 @@ const httpServer = http.createServer(async (req, res) => {
             return;
           }
 
-          const chatId    = String(grpRow.telegram_chat_id);
-          const members   = (grpRow.group_members ?? []) as GroupMember[];
+          const chatId = String(grpRow.telegram_chat_id);
+          // Supabase retorna accounts como array no join — normaliza para Account | null
+          const members: GroupMember[] = (grpRow.group_members ?? []).map((m: any) => ({
+            ...m,
+            accounts: Array.isArray(m.accounts) ? (m.accounts[0] ?? null) : (m.accounts ?? null),
+          }));
           const firstMember = members.find((m) => m.is_active && m.accounts?.is_active);
 
           if (!firstMember?.accounts) {
