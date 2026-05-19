@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v7 — multi-account parallel polling, peer pre-warm for all accounts, dedup parallelized
+// v7 — insert do dispatch_log em background + queries iniciais em paralelo
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -13,19 +13,19 @@ const supabase = createClient(
 );
 
 /* ─── Constantes ─── */
-const SEND_TIMEOUT_MS             = 15_000;
-const RETRY_BUDGET_MS             = 50_000;
-const RELOAD_INTERVAL_MS          = 30_000;
-const LOOKAHEAD_MS                = 2 * 60 * 1000;
-const KEEPALIVE_INTERVAL_MS       = 45_000;
+const SEND_TIMEOUT_MS        = 15_000;
+const RETRY_BUDGET_MS        = 50_000;
+const RELOAD_INTERVAL_MS     = 30_000;
+const LOOKAHEAD_MS           = 2 * 60 * 1000;
+const KEEPALIVE_INTERVAL_MS  = 45_000;
 
 // Monitoramento de posição
-const MONITOR_DELAY_CLOSED_MS      = 6_000;
-const MONITOR_MAX_OPEN_MS          = 5 * 60_000;
-const MONITOR_POLL_MS              = 5_000;
-const LISTEN_POLL_MS               = 100;   // poll agressivo — 100ms por conta
-const MONITOR_HISTORY_LIMIT        = 150;
-const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2h
+const MONITOR_DELAY_CLOSED_MS     = 6_000;
+const MONITOR_MAX_OPEN_MS         = 5 * 60_000;
+const MONITOR_POLL_MS             = 5_000;
+const LISTEN_POLL_MS              = 400;
+const MONITOR_HISTORY_LIMIT       = 150;
+const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
 
 /* ─── Tipos ─── */
 interface Account {
@@ -76,7 +76,6 @@ interface MemberResult {
 }
 
 /* ─── Peer cache ─── */
-// chave = "accountId:chatId" — accessHash é específico por conta
 const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
 
@@ -145,24 +144,6 @@ async function getOrResolvePeer(
   }
 }
 
-/* ─── Pre-aquece peer para todas as contas de um grupo em paralelo ─── */
-async function prewarmPeersForAccounts(
-  accounts: Account[],
-  chatId: string
-): Promise<void> {
-  await Promise.allSettled(
-    accounts.map(async (account) => {
-      try {
-        const client = await clientPool.get(account);
-        await getOrResolvePeer(client, chatId, account.id);
-        console.log(`[peer-prewarm] ✓ ${account.phone_number} → ${chatId}`);
-      } catch (err: any) {
-        console.warn(`[peer-prewarm] ✗ ${account.phone_number}: ${err.message}`);
-      }
-    })
-  );
-}
-
 /* ─── Pool de conexões Telegram persistente ─── */
 class TelegramClientPool {
   private clients            = new Map<string, TelegramClient>();
@@ -223,8 +204,6 @@ class TelegramClientPool {
 
     if (existing?.connected && !sessionChanged) return existing;
 
-    // Se já tem uma conexão em andamento, aguarda ela em vez de criar outra
-    // (isso evita AUTH_KEY_DUPLICATED por corridas de conexão paralela)
     const inflight = this.connectingPromises.get(account.id);
     if (inflight) {
       console.log(`[pool] Aguardando conexão em andamento para ${account.phone_number}...`);
@@ -254,12 +233,10 @@ class TelegramClientPool {
         }
       );
 
-      // Desativa o loop de updates para evitar conflito com outra sessão ativa
       (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
-      // Sincroniza dialogs EM BACKGROUND — não bloqueia o envio
       client.getDialogs({ limit: 100 }).then(() => {
         console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
       }).catch((err: any) => {
@@ -281,7 +258,6 @@ class TelegramClientPool {
     }
   }
 
-  /** Reconecta uma conta específica (chamado pelo endpoint /reload). */
   async reload(account: Account): Promise<TelegramClient> {
     const existing = this.clients.get(account.id);
     if (existing) {
@@ -445,11 +421,9 @@ async function sendAggressively(
 
               if (waitMs < budgetEnd - Date.now() - 500) {
                 await new Promise((r) => setTimeout(r, waitMs));
-                // Após flood wait: garante client conectado antes de reenviar
-                const freshClient = await clientPool.get(account);
                 peerCache.delete(`${account.id}:${telegramChatId}`);
-                const freshPeer = await getOrResolvePeer(freshClient, telegramChatId, account.id);
-                await freshClient.sendMessage(freshPeer as any, { message: messageText });
+                const freshPeer = await getOrResolvePeer(client, telegramChatId, account.id);
+                await client.sendMessage(freshPeer as any, { message: messageText });
                 return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
@@ -513,7 +487,8 @@ async function trySendMember(
     );
   }
 
-  await supabase.from("dispatch_logs").insert({
+  // Insert em background — não bloqueia o caminho crítico de envio
+  supabase.from("dispatch_logs").insert({
     user_id:             schedule.user_id,
     group_id:            group.id,
     account_id:          account.id,
@@ -525,12 +500,14 @@ async function trySendMember(
     chat_name_snapshot:  group.telegram_chat_name,
     sent_at:             logStatus === "sent" ? new Date().toISOString() : null,
     error_message:       errorMsg ?? null,
+  }).then(({ error: e }) => {
+    if (e) console.error(`[log] Falha ao inserir dispatch_log para ${account.id}:`, e.message);
   });
 
   return { member_id: member.id, account_id: account.id, position_rank: positionRank, status: logStatus, retryable, error: errorMsg };
 }
 
-/* ─── Processa todos os membros em paralelo ─── */
+/* ─── Processa membros em paralelo ─── */
 async function processMembersOf(
   schedule: Schedule,
   alreadySent: Set<string>
@@ -548,37 +525,86 @@ async function processMembersOf(
   return parallel;
 }
 
-/* ─── Monitor de posições ─── */
+async function waitForAdminSignal(
+  client: TelegramClient,
+  telegramChatId: string,
+  timeoutMs: number = 30 * 60_000
+): Promise<boolean> {
+  const deadline    = Date.now() + timeoutMs;
+  const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
+  let lastSeenMsgId = 0;
+
+  try { await getOrResolvePeer(client, telegramChatId, client.session.toString()); } catch {}
+
+  console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
+
+  while (Date.now() < deadline) {
+    try {
+      const peer = await getOrResolvePeer(client, telegramChatId, client.session.toString());
+
+      const result = await client.invoke(
+        new Api.messages.GetHistory({
+          peer:       peer as any,
+          limit:      10,
+          offsetDate: 0,
+          offsetId:   0,
+          maxId:      0,
+          minId:      0,
+          hash:       bigInt(0),
+          addOffset:  0,
+        })
+      ) as any;
+
+      const recentMsgs: any[] = (result.messages ?? [])
+        .filter((m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId);
+
+      if (recentMsgs.length > 0) {
+        lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
+      }
+
+      const signal = recentMsgs.some((m: any) => {
+        const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
+        const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+        return isOk || isMedia;
+      });
+
+      if (signal) {
+        console.log(`[admin-signal] ✓ Sinal do admin detectado em ${telegramChatId}`);
+        return true;
+      }
+    } catch (err: any) {
+      console.warn(`[admin-signal] Erro ao buscar histórico: ${err.message}`);
+    }
+
+    await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
+  }
+
+  console.warn(`[admin-signal] Timeout — nenhum sinal do admin em ${telegramChatId}`);
+  return false;
+}
+
 async function monitorPositions(
   telegramChatId: string,
   sentMembers: Array<{ account_id: string; message_text: string }>,
   scheduleId: string,
   dispatchedAt: Date,
-  groupType: "open" | "closed",
-  allGroupAccounts: Account[]
+  groupType: "open" | "closed"
 ): Promise<void> {
   if (sentMembers.length === 0) return;
 
-  // Tenta cada conta do grupo até conseguir um client funcional
-  let client: TelegramClient | null = null;
-  let monitorAccount: Account | null = null;
-
-  for (const acc of allGroupAccounts) {
-    const cached = accountCache.get(acc.id) ?? acc;
-    const c = await clientPool.get(cached).catch(() => null);
-    if (c) {
-      client = c;
-      monitorAccount = cached;
-      break;
-    }
-  }
-
-  if (!client || !monitorAccount) {
-    console.warn("[monitor] Nenhuma conta disponível — monitoramento de posição ignorado");
+  const account = accountCache.get(sentMembers[0].account_id);
+  if (!account) {
+    console.warn("[monitor] Conta não encontrada no cache — monitoramento de posição ignorado");
     return;
   }
 
-  const windowStartUnix = Math.floor((dispatchedAt.getTime() - 2 * 60_000) / 1000);
+  const client = await clientPool.get(account).catch(() => null);
+  if (!client) {
+    console.warn("[monitor] Não foi possível obter client — monitoramento de posição ignorado");
+    return;
+  }
+
+  const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
   const deadline        = Date.now() + (groupType === "closed" ? MONITOR_DELAY_CLOSED_MS + 10_000 : MONITOR_MAX_OPEN_MS);
   const ourTexts        = new Set(sentMembers.map((m) => m.message_text).filter(Boolean));
 
@@ -590,7 +616,7 @@ async function monitorPositions(
 
   while (Date.now() < deadline) {
     try {
-      const peer = await getOrResolvePeer(client, telegramChatId, monitorAccount.id);
+      const peer = await getOrResolvePeer(client, telegramChatId, account.id);
 
       const result = await client.invoke(
         new Api.messages.GetHistory({
@@ -664,221 +690,159 @@ async function monitorPositions(
   console.warn(`[monitor] Timeout — posições não registradas para schedule ${scheduleId}`);
 }
 
-/* ─── Lógica de dispatch após detecção do sinal ─── */
-async function dispatchAfterSignal(
-  schedule: Schedule,
-  group: Group,
-  chatId: string,
-  scheduleId: string,
-  signalDetectedAt: Date
-): Promise<void> {
-  // dedup e dispatch em paralelo com o pre-warm já feito — caminho mais curto possível
-  const alreadySent = await getAlreadySentAccountIds(schedule);
-  const results     = await processMembersOf(schedule, alreadySent);
-
-  const allGroupAccounts = (group.group_members ?? [])
-    .filter((m) => m.is_active && m.accounts?.is_active)
-    .map((m) => accountCache.get(m.accounts!.id) ?? m.accounts!);
-
-  const sentForMonitor = results
-    .filter((r) => r.status === "sent")
-    .map((r) => {
-      const member = (group.group_members ?? []).find((m) => m.accounts?.id === r.account_id);
-      return { account_id: r.account_id, message_text: member?.message_text ?? "" };
-    })
-    .filter((r) => r.message_text);
-
-  if (sentForMonitor.length > 0) {
-    monitorPositions(chatId, sentForMonitor, scheduleId, signalDetectedAt, "open", allGroupAccounts)
-      .catch((err) => console.error("[dispatch] Erro no monitoramento:", err.message));
-  }
-
-  const sentCount         = results.filter((r) => r.status === "sent").length;
-  const skippedCount      = results.filter((r) => r.status === "skipped").length;
-  const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
-  const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
-  const totalDelivered    = sentCount + skippedCount;
-  const hasActiveMembers  = (group.group_members ?? []).some((m) => m.is_active && m.accounts?.is_active);
-  const allSucceeded      = hasActiveMembers && retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
-  const nowISO            = new Date().toISOString();
-
-  if (allSucceeded) {
-    let nextRun: string;
-    try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
-    catch (err) {
-      console.error(`[dispatch] cron inválido no schedule ${scheduleId}:`, err);
-      await supabase.from("schedules").update({ is_active: false }).eq("id", scheduleId);
-      return;
-    }
-    await supabase.from("schedules").update({
-      next_run_at:         nextRun,
-      last_run_at:         nowISO,
-      retry_until:         null,
-      retry_count:         0,
-      last_attempt_at:     nowISO,
-      last_attempt_status: "sent",
-      last_attempt_error:  null,
-    }).eq("id", scheduleId);
-    console.log(`[dispatch] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
-    scheduleTimer(scheduleId, nextRun);
-  } else {
-    const newRetryCount = schedule.retry_count + 1;
-    const retryUntil    = new Date(Date.now() + schedule.retry_window_seconds * 1000).toISOString();
-    const failedErrors  = results
-      .filter((r) => r.status === "failed" && r.error)
-      .map((r) => `[${r.account_id}] ${r.error}`).join("; ");
-    await supabase.from("schedules").update({
-      retry_until:         retryUntil,
-      retry_count:         newRetryCount,
-      last_attempt_at:     nowISO,
-      last_attempt_status: "retrying",
-      last_attempt_error:  failedErrors || null,
-    }).eq("id", scheduleId);
-    const intervalNext = calcRetryInterval(newRetryCount, schedule.retry_interval_seconds, schedule.retry_interval_max_seconds);
-    const retryAt = new Date(Date.now() + intervalNext * 1000);
-    if (retryAt < new Date(retryUntil)) scheduleTimer(scheduleId, retryAt.toISOString());
-  }
-}
-
-/* ─── Listener não-bloqueante para grupos abertos (schedule-driven) ──────────
-   v7: TODAS as contas do grupo fazem poll em paralelo (100ms cada).
-   A primeira que detectar o sinal aborta todas as outras via AbortController
-   compartilhado e dispara o envio imediatamente.
-   Peer de todas as contas é pré-aquecido ANTES de entrar no loop.
-   dedup (getAlreadySentAccountIds) roda no momento do sinal, não antes.
-   ──────────────────────────────────────────────────────────────────────────── */
+/* ─── Listener não-bloqueante para grupos abertos (schedule-driven) ─── */
 function startScheduledGroupListener(
   schedule: Schedule,
-  group: Group
+  group: Group,
+  account: Account
 ): void {
   const groupId    = group.id;
   const chatId     = group.telegram_chat_id!;
   const scheduleId = schedule.id;
   const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
 
-  // Cancela listener anterior se existir
   const existing = listenMap.get(groupId);
   if (existing) existing.abort();
 
-  const ctrl = new AbortController();
+  const ctrl      = new AbortController();
   listenMap.set(groupId, ctrl);
 
-  // Todas as contas ativas do grupo
-  const activeMembers = (group.group_members ?? [])
-    .filter((m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
-    .sort((a, b) => a.position - b.position);
+  const deadline    = Date.now() + OPEN_GROUP_LISTEN_TIMEOUT_MS;
+  const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
+  let lastSeenMsgId = 0;
 
-  if (activeMembers.length === 0) {
-    console.warn(`[schedule-listen] Nenhuma conta ativa para schedule ${scheduleId}`);
-    listenMap.delete(groupId);
-    return;
-  }
+  console.log(`[schedule-listen] 👂 Aguardando sinal do admin em ${chatId} para schedule ${scheduleId}`);
 
-  console.log(`[schedule-listen] 👂 ${activeMembers.length} conta(s) monitorando ${chatId} (schedule ${scheduleId})`);
-
-  // Executa em background — não bloqueia o loop principal
   (async () => {
     try {
-      // ── Fase 1: pre-warm de todas as contas e peers em paralelo ──
-      // Isso garante que no momento do sinal todas as conexões e peers
-      // já estão prontos, minimizando a latência do envio.
-      const allAccounts = activeMembers.map((m) => accountCache.get(m.accounts!.id) ?? m.accounts!);
-      await Promise.allSettled([
-        clientPool.prewarm(allAccounts),
-        prewarmPeersForAccounts(allAccounts, chatId),
-      ]);
+      let client = await clientPool.get(account).catch(() => null);
+      if (!client) {
+        console.warn(`[schedule-listen] Sem client para ${scheduleId} — abortando listener`);
+        listenMap.delete(groupId);
+        return;
+      }
 
-      if (ctrl.signal.aborted) return;
+      try { await getOrResolvePeer(client, chatId, account.id); } catch {}
 
-      // ── Fase 2: poll paralelo — todas as contas verificam ao mesmo tempo ──
-      // Cada conta tem seu próprio loop independente.
-      // Usamos uma Promise.race entre todos os pollers: o primeiro que detectar
-      // o sinal resolve a race e o AbortController cancela os outros.
-      const deadline  = Date.now() + OPEN_GROUP_LISTEN_TIMEOUT_MS;
-      const startUnix = Math.floor((Date.now() - 10_000) / 1000);
+      while (Date.now() < deadline && !ctrl.signal.aborted) {
+        try {
+          if (!client.connected) {
+            console.warn(`[schedule-listen] Client desconectado — reconectando para ${scheduleId}`);
+            client = await clientPool.get(account);
+            try { await getOrResolvePeer(client, chatId, account.id); } catch {}
+          }
 
-      // fired: flag para garantir que só um poller dispara o envio
-      let fired = false;
+          const peer   = await getOrResolvePeer(client, chatId, account.id);
+          const result = await client.invoke(
+            new Api.messages.GetHistory({
+              peer: peer as any, limit: 10,
+              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+              hash: bigInt(0), addOffset: 0,
+            })
+          ) as any;
 
-      const pollerPromises = activeMembers.map((member) => {
-        const account = accountCache.get(member.accounts!.id) ?? member.accounts!;
-        return (async () => {
-          let client = await clientPool.get(account).catch(() => null);
-          if (!client) {
-            console.warn(`[schedule-listen] Sem client para ${account.phone_number} — poller ignorado`);
+          const recentMsgs: any[] = (result.messages ?? []).filter(
+            (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
+          );
+          if (recentMsgs.length > 0) {
+            lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
+          }
+
+          const gotSignal = recentMsgs.some((m: any) => {
+            const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
+            const isOk    = text === "ok";
+            const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+            return isOk || isMedia;
+          });
+
+          if (gotSignal && !ctrl.signal.aborted) {
+            console.log(`[schedule-listen] ✓ Sinal detectado — disparando schedule ${scheduleId}`);
+            listenMap.delete(groupId);
+
+            const dispatchedAt = new Date();
+            const alreadySent  = await getAlreadySentAccountIds(schedule);
+            const results      = await processMembersOf(schedule, alreadySent);
+
+            const sentForMonitor = results
+              .filter((r) => r.status === "sent")
+              .map((r) => {
+                const member = (group.group_members ?? []).find((m) => m.accounts?.id === r.account_id);
+                return { account_id: r.account_id, message_text: member?.message_text ?? "" };
+              })
+              .filter((r) => r.message_text);
+
+            if (sentForMonitor.length > 0) {
+              monitorPositions(chatId, sentForMonitor, scheduleId, dispatchedAt, "open")
+                .catch((err) => console.error("[schedule-listen] Erro no monitoramento:", err.message));
+            }
+
+            const sentCount         = results.filter((r) => r.status === "sent").length;
+            const skippedCount      = results.filter((r) => r.status === "skipped").length;
+            const retryableFailures = results.filter((r) => r.status === "failed" && r.retryable);
+            const permanentFailures = results.filter((r) => r.status === "failed" && !r.retryable);
+            const totalDelivered    = sentCount + skippedCount;
+            const hasActiveMembers  = (group.group_members ?? []).some((m) => m.is_active && m.accounts?.is_active);
+            const allSucceeded      = hasActiveMembers && retryableFailures.length === 0 && permanentFailures.length === 0 && totalDelivered > 0;
+            const nowISO            = new Date().toISOString();
+
+            if (allSucceeded) {
+              let nextRun: string;
+              try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
+              catch (err) {
+                console.error(`[schedule-listen] cron inválido no schedule ${scheduleId}:`, err);
+                await supabase.from("schedules").update({ is_active: false }).eq("id", scheduleId);
+                return;
+              }
+              await supabase.from("schedules").update({
+                next_run_at:         nextRun,
+                last_run_at:         nowISO,
+                retry_until:         null,
+                retry_count:         0,
+                last_attempt_at:     nowISO,
+                last_attempt_status: "sent",
+                last_attempt_error:  null,
+              }).eq("id", scheduleId);
+              console.log(`[schedule-listen] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
+              scheduleTimer(scheduleId, nextRun);
+            } else {
+              const newRetryCount  = schedule.retry_count + 1;
+              const retryUntil     = new Date(Date.now() + schedule.retry_window_seconds * 1000).toISOString();
+              const failedErrors   = results
+                .filter((r) => r.status === "failed" && r.error)
+                .map((r) => `[${r.account_id}] ${r.error}`).join("; ");
+              await supabase.from("schedules").update({
+                retry_until:         retryUntil,
+                retry_count:         newRetryCount,
+                last_attempt_at:     nowISO,
+                last_attempt_status: "retrying",
+                last_attempt_error:  failedErrors || null,
+              }).eq("id", scheduleId);
+              const intervalNext = calcRetryInterval(newRetryCount, schedule.retry_interval_seconds, schedule.retry_interval_max_seconds);
+              const retryAt = new Date(Date.now() + intervalNext * 1000);
+              if (retryAt < new Date(retryUntil)) scheduleTimer(scheduleId, retryAt.toISOString());
+            }
             return;
           }
 
-          let lastSeenMsgId = 0;
-
-          while (Date.now() < deadline && !ctrl.signal.aborted) {
-            try {
-              // Reconecta se desconectado
-              if (!client.connected) {
-                console.warn(`[schedule-listen] ${account.phone_number} desconectado — reconectando`);
-                client = await clientPool.get(account);
-                try { await getOrResolvePeer(client, chatId, account.id); } catch {}
-              }
-
-              const peer   = await getOrResolvePeer(client, chatId, account.id);
-              const result = await client.invoke(
-                new Api.messages.GetHistory({
-                  peer: peer as any, limit: 10,
-                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-                  hash: bigInt(0), addOffset: 0,
-                })
-              ) as any;
-
-              const recentMsgs: any[] = (result.messages ?? []).filter(
-                (m: any) =>
-                  (m.className === "Message" || m._ === "message") &&
-                  m.date >= startUnix &&
-                  m.id > lastSeenMsgId
-              );
-
-              if (recentMsgs.length > 0) {
-                lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
-              }
-
-              const gotSignal = recentMsgs.some((m: any) => {
-                const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
-                const isOk    = text === "ok";
-                const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-                return isOk || isMedia;
-              });
-
-              if (gotSignal && !ctrl.signal.aborted && !fired) {
-                fired = true;
-                ctrl.abort(); // cancela todos os outros pollers imediatamente
-                listenMap.delete(groupId);
-
-                console.log(`[schedule-listen] ✓ Sinal detectado por ${account.phone_number} — disparando schedule ${scheduleId}`);
-                const signalDetectedAt = new Date();
-                await dispatchAfterSignal(schedule, group, chatId, scheduleId, signalDetectedAt);
-                return;
-              }
-
-            } catch (err: any) {
-              if (!ctrl.signal.aborted) {
-                console.warn(`[schedule-listen] ${account.phone_number} erro no poll: ${err.message}`);
-                await new Promise((r) => setTimeout(r, 2_000));
-              }
-            }
-
-            if (!ctrl.signal.aborted) {
-              await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
-            }
+        } catch (err: any) {
+          if (!ctrl.signal.aborted) {
+            console.warn(`[schedule-listen] Erro ao buscar histórico (${scheduleId}): ${err.message}`);
+            await new Promise((r) => setTimeout(r, 2_000));
           }
-        })();
-      });
+        }
 
-      await Promise.allSettled(pollerPromises);
+        if (!ctrl.signal.aborted) {
+          await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
+        }
+      }
 
       listenMap.delete(groupId);
 
-      if (fired || ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted) {
+        console.log(`[schedule-listen] ⏹ Listener abortado para schedule ${scheduleId}`);
+        return;
+      }
 
-      // Timeout: avança para próxima semana sem ter disparado
       console.warn(`[schedule-listen] ⏰ Timeout 2h — nenhum sinal do admin para schedule ${scheduleId}`);
       const nowISO = new Date().toISOString();
       let nextRun: string;
@@ -906,19 +870,26 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const now    = new Date();
   const nowISO = now.toISOString();
 
-  const { data: rows, error } = await supabase
-    .from("schedules")
-    .select(`
-      id, cron_expression, user_id, group_id, next_run_at,
-      retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
-      retry_count, retry_until, last_attempt_at,
-      groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
-        group_members(id, message_text, position, is_active,
-          accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
-    `)
-    .eq("id", scheduleId)
-    .eq("is_active", true)
-    .single();
+  // Busca schedule e deduplicação em paralelo — economiza ~60ms
+  const [scheduleResult, _] = await Promise.all([
+    supabase
+      .from("schedules")
+      .select(`
+        id, cron_expression, user_id, group_id, next_run_at,
+        retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
+        retry_count, retry_until, last_attempt_at,
+        groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
+          group_members(id, message_text, position, is_active,
+            accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
+      `)
+      .eq("id", scheduleId)
+      .eq("is_active", true)
+      .single(),
+    // Aquece a conexão Supabase em paralelo (sem usar o resultado aqui)
+    supabase.from("schedules").select("id").eq("id", scheduleId).limit(1),
+  ]);
+
+  const { data: rows, error } = scheduleResult;
 
   if (error || !rows) {
     console.warn(`[timer] Schedule ${scheduleId} não encontrado ou inativo.`);
@@ -933,7 +904,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
-  // Atualiza accountCache com os dados mais recentes do banco
   if (group.group_members) {
     group.group_members = group.group_members.map((m) => ({
       ...m,
@@ -951,8 +921,16 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Inicia listener não-bloqueante com todas as contas fazendo poll
-    startScheduledGroupListener(schedule, group);
+    const firstAccount = (group.group_members ?? [])
+      .filter((m) => m.is_active && m.accounts?.is_active)
+      .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
+
+    if (!firstAccount) {
+      console.warn(`[timer] Schedule ${scheduleId}: nenhuma conta ativa no grupo — abortando.`);
+      return;
+    }
+
+    startScheduledGroupListener(schedule, group, firstAccount);
 
     await supabase.from("schedules").update({
       retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
@@ -961,15 +939,11 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       last_attempt_error:  null,
     }).eq("id", scheduleId);
 
-    console.log(`[timer] 👂 Schedule ${scheduleId}: multi-account listener iniciado (grupo aberto ${group.id})`);
+    console.log(`[timer] 👂 Schedule ${scheduleId}: listener não-bloqueante iniciado (grupo aberto ${group.id})`);
     return;
   }
 
-  // Grupo fechado: dedup + dispatch imediato
-  const allGroupAccounts = (group.group_members ?? [])
-    .filter((m) => m.is_active && m.accounts?.is_active)
-    .map((m) => accountCache.get(m.accounts!.id) ?? m.accounts!);
-
+  // Busca deduplicação em paralelo com o que já sabemos que vem a seguir
   const alreadySent = await getAlreadySentAccountIds(schedule);
   if (alreadySent.size > 0) {
     console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — serão pulados.`);
@@ -991,8 +965,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       sentForMonitor,
       scheduleId,
       now,
-      group.group_type ?? "closed",
-      allGroupAccounts
+      group.group_type ?? "closed"
     ).catch((err) => console.error("[monitor] Erro não capturado:", err.message));
   }
 
@@ -1021,7 +994,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    await supabase.from("schedules").update({
+    // Update do schedule em background — mensagem já foi enviada, isso não é crítico
+    supabase.from("schedules").update({
       next_run_at:         nextRun,
       last_run_at:         nowISO,
       retry_until:         null,
@@ -1029,7 +1003,9 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       last_attempt_at:     nowISO,
       last_attempt_status: "sent",
       last_attempt_error:  null,
-    }).eq("id", scheduleId);
+    }).eq("id", scheduleId).then(({ error: e }) => {
+      if (e) console.error(`[timer] Falha ao atualizar schedule ${scheduleId}:`, e.message);
+    });
 
     console.log(`[timer] ✓ Schedule ${scheduleId} OK. Próxima: ${nextRun}`);
     scheduleTimer(scheduleId, nextRun);
@@ -1241,16 +1217,7 @@ async function prewarmAccounts(): Promise<void> {
   }
 }
 
-/* ─── HTTP server interno ────────────────────────────────────────────────────
-   Rotas:
-     GET  /accounts/:id/chats
-     GET  /accounts/:id/chat-members?chat_id=XXXX
-     GET  /accounts/:id/chat-count?chat_id=XXXX
-     POST /accounts/:id/reload
-     POST /groups/:id/listen
-     DELETE /groups/:id/listen
-   Protegido por WORKER_SECRET (header x-worker-secret).
-   ─────────────────────────────────────────────────────────────────────────── */
+/* ─── HTTP server interno ─── */
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
 
@@ -1283,10 +1250,10 @@ const httpServer = http.createServer(async (req, res) => {
       const chats   = dialogs
         .filter((d) => d.isGroup || d.isChannel)
         .map((d) => ({
-          id:         String(d.id),
-          name:       d.title ?? d.name ?? "Sem nome",
-          type:       d.isChannel ? "channel" : "group",
-          accessHash: null,
+          id:          String(d.id),
+          name:        d.title ?? d.name ?? "Sem nome",
+          type:        d.isChannel ? "channel" : "group",
+          accessHash:  null,
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -1316,7 +1283,10 @@ const httpServer = http.createServer(async (req, res) => {
         const channelId = bigInt(rawId);
         const result = await client.invoke(
           new Api.channels.GetFullChannel({
-            channel: new Api.InputChannel({ channelId, accessHash: bigInt(0) }),
+            channel: new Api.InputChannel({
+              channelId,
+              accessHash: bigInt(0),
+            }),
           })
         ) as any;
         const participantsCount = result?.fullChat?.participantsCount;
@@ -1334,7 +1304,11 @@ const httpServer = http.createServer(async (req, res) => {
           const absRaw  = rawId.replace(/^100/, "");
           const dialog  = dialogs.find((d) => {
             const dIdStr = String(d.id).replace(/^-/, "");
-            return dIdStr === rawId || dIdStr === absRaw || String(d.id) === chatId || `-100${dIdStr}` === chatId || `-${dIdStr}` === chatId;
+            return dIdStr === rawId ||
+                   dIdStr === absRaw ||
+                   String(d.id) === chatId ||
+                   `-100${dIdStr}` === chatId ||
+                   `-${dIdStr}` === chatId;
           });
           if (dialog?.entity) {
             const ent = dialog.entity as any;
@@ -1389,8 +1363,8 @@ const httpServer = http.createServer(async (req, res) => {
     const chatId    = url.searchParams.get("chat_id");
     const account   = accountCache.get(accountId);
 
-    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
-    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    if (!chatId)    return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account)   return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
 
     type MemberOut = { id: string; name: string | null; username: string | null; phone: string | null };
 
@@ -1499,9 +1473,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST/DELETE /groups/:id/listen ───────────────────────────────────────
-  // Escuta manual (botão "Aguardar OK da admin").
-  // Usa o mesmo sistema multi-account: todas as contas do grupo fazem poll em paralelo.
+  // ── POST/DELETE /groups/:id/listen ──────────────────────────────────────
   const listenMap: Map<string, AbortController> = (globalThis as any).__listenMap ??= new Map();
 
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
@@ -1530,7 +1502,7 @@ const httpServer = http.createServer(async (req, res) => {
           const { data: grpRow } = await supabase
             .from("groups")
             .select(`
-              id, telegram_chat_id, telegram_chat_name, group_type, name, user_id,
+              id, telegram_chat_id, group_type,
               group_members(id, message_text, position, is_active,
                 accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
             `)
@@ -1539,162 +1511,132 @@ const httpServer = http.createServer(async (req, res) => {
 
           if (!grpRow) {
             console.warn(`[listen] Grupo ${groupId} não encontrado`);
-            listenMap.delete(groupId);
             return;
           }
 
           const chatId = String(grpRow.telegram_chat_id);
-
-          // Normaliza accounts (Supabase pode retornar array no join)
           const members: GroupMember[] = (grpRow.group_members ?? []).map((m: any) => ({
             ...m,
             accounts: Array.isArray(m.accounts) ? (m.accounts[0] ?? null) : (m.accounts ?? null),
           }));
+          const firstMember = members.find((m) => m.is_active && m.accounts?.is_active);
 
-          const activeMembers = members.filter((m) => m.is_active && m.accounts?.is_active);
-          if (activeMembers.length === 0) {
+          if (!firstMember?.accounts) {
             console.warn(`[listen] Nenhuma conta ativa no grupo ${groupId}`);
-            listenMap.delete(groupId);
             return;
           }
 
-          // Pre-warm de todas as contas + peers
-          const allAccounts = activeMembers.map((m) => accountCache.get(m.accounts!.id) ?? m.accounts!);
-          await Promise.allSettled([
-            clientPool.prewarm(allAccounts),
-            prewarmPeersForAccounts(allAccounts, chatId),
-          ]);
-
-          if (ctrl.signal.aborted) { listenMap.delete(groupId); return; }
+          const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
+          const client  = await clientPool.get(account);
 
           const MANUAL_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
-          const deadline  = Date.now() + MANUAL_LISTEN_TIMEOUT_MS;
-          const startUnix = Math.floor((Date.now() - 10_000) / 1000);
-          let fired = false;
+          const deadline    = Date.now() + MANUAL_LISTEN_TIMEOUT_MS;
+          const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
+          let lastSeenMsgId = 0;
 
-          console.log(`[listen] 👂 ${activeMembers.length} conta(s) monitorando ${chatId} (manual grupo ${groupId})`);
+          try { await getOrResolvePeer(client, chatId, account.id); } catch {}
 
-          const pollerPromises = activeMembers.map((member) => {
-            const account = accountCache.get(member.accounts!.id) ?? member.accounts!;
-            return (async () => {
-              let client = await clientPool.get(account).catch(() => null);
-              if (!client) return;
+          console.log(`[listen] 👂 Aguardando OK da admin em ${chatId} (grupo ${groupId})`);
 
-              let lastSeenMsgId = 0;
+          while (Date.now() < deadline && !ctrl.signal.aborted) {
+            try {
+              const peer   = await getOrResolvePeer(client, chatId, account.id);
+              const result = await client.invoke(
+                new Api.messages.GetHistory({
+                  peer: peer as any, limit: 10,
+                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+                  hash: bigInt(0), addOffset: 0,
+                })
+              ) as any;
 
-              while (Date.now() < deadline && !ctrl.signal.aborted) {
-                try {
-                  if (!client.connected) {
-                    client = await clientPool.get(account);
-                    try { await getOrResolvePeer(client, chatId, account.id); } catch {}
-                  }
+              const recentMsgs = (result.messages ?? []).filter(
+                (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
+              );
 
-                  const peer   = await getOrResolvePeer(client, chatId, account.id);
-                  const result = await client.invoke(
-                    new Api.messages.GetHistory({
-                      peer: peer as any, limit: 10,
-                      offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-                      hash: bigInt(0), addOffset: 0,
-                    })
-                  ) as any;
-
-                  const recentMsgs = (result.messages ?? []).filter(
-                    (m: any) =>
-                      (m.className === "Message" || m._ === "message") &&
-                      m.date >= startUnix &&
-                      m.id > lastSeenMsgId
-                  );
-
-                  if (recentMsgs.length > 0) {
-                    lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
-                  }
-
-                  const gotSignal = recentMsgs.some((m: any) => {
-                    const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
-                    const isOk    = text === "ok";
-                    const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-                    return isOk || isMedia;
-                  });
-
-                  if (gotSignal && !ctrl.signal.aborted && !fired) {
-                    fired = true;
-                    ctrl.abort();
-                    listenMap.delete(groupId);
-
-                    console.log(`[listen] ✓ Sinal detectado por ${account.phone_number} — disparando grupo ${groupId}`);
-
-                    await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
-
-                    // Monta scheduleStub para o dispatch manual
-                    // usa getAlreadySentAccountIds com scheduleId baseado no groupId+ciclo
-                    // para evitar reenvio se o botão for clicado duas vezes
-                    const scheduleStub: Schedule = {
-                      id:                         `manual-${groupId}-${Date.now()}`,
-                      user_id:                    (grpRow as any).user_id ?? "",
-                      group_id:                   groupId,
-                      cron_expression:            "0 0 * * 0",
-                      next_run_at:                new Date().toISOString(),
-                      retry_window_seconds:       60,
-                      retry_interval_seconds:     5,
-                      retry_interval_max_seconds: 30,
-                      retry_count:                0,
-                      retry_until:                null,
-                      last_attempt_at:            null,
-                      groups: {
-                        id:                 groupId,
-                        name:               (grpRow as any).name ?? groupId,
-                        telegram_chat_id:   chatId,
-                        telegram_chat_name: (grpRow as any).telegram_chat_name ?? null,
-                        group_type:         "open" as const,
-                        group_members:      members,
-                      },
-                    };
-
-                    const signalDetectedAt = new Date();
-                    // Para disparo manual: alreadySent começa vazio (não há schedule real com histórico)
-                    // mas protegemos contra duplo clique via flag `fired`
-                    const alreadySent = new Set<string>();
-                    const results     = await processMembersOf(scheduleStub, alreadySent);
-
-                    const sentForMonitor = results
-                      .filter((r) => r.status === "sent")
-                      .map((r) => {
-                        const m = members.find((mb) => mb.accounts?.id === r.account_id);
-                        return { account_id: r.account_id, message_text: m?.message_text ?? "" };
-                      })
-                      .filter((r) => r.message_text);
-
-                    if (sentForMonitor.length > 0) {
-                      monitorPositions(chatId, sentForMonitor, scheduleStub.id, signalDetectedAt, "open", allAccounts)
-                        .catch((err) => console.error("[listen] Erro no monitoramento:", err.message));
-                    }
-
-                    const sent = results.filter((r) => r.status === "sent").length;
-                    console.log(`[listen] ✓ Disparo manual concluído para grupo ${groupId}: ${sent} enviada(s)`);
-                    return;
-                  }
-                } catch (err: any) {
-                  if (!ctrl.signal.aborted) {
-                    console.warn(`[listen] ${account.phone_number} erro: ${err.message}`);
-                    await new Promise((r) => setTimeout(r, 2_000));
-                  }
-                }
-
-                if (!ctrl.signal.aborted) {
-                  await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
-                }
+              if (recentMsgs.length > 0) {
+                lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
               }
-            })();
-          });
 
-          await Promise.allSettled(pollerPromises);
+              const gotSignal = recentMsgs.some((m: any) => {
+                const text    = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
+                const isOk    = text === "ok";
+                const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+                return isOk || isMedia;
+              });
 
-          listenMap.delete(groupId);
-          if (!fired && !ctrl.signal.aborted) {
+              if (gotSignal && !ctrl.signal.aborted) {
+                console.log(`[listen] ✓ Sinal da admin detectado para grupo ${groupId} — disparando`);
+                listenMap.delete(groupId);
+
+                await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
+
+                const { data: grpFull } = await supabase
+                  .from("groups")
+                  .select("name, telegram_chat_name, user_id")
+                  .eq("id", groupId)
+                  .single();
+
+                const scheduleStub = {
+                  id:                         `manual-${groupId}-${Date.now()}`,
+                  user_id:                    grpFull?.user_id ?? "",
+                  group_id:                   groupId,
+                  cron_expression:            "0 0 * * 0",
+                  next_run_at:                new Date().toISOString(),
+                  retry_window_seconds:       60,
+                  retry_interval_seconds:     5,
+                  retry_interval_max_seconds: 30,
+                  retry_count:                0,
+                  retry_until:                null,
+                  last_attempt_at:            null,
+                  groups: {
+                    id:                 groupId,
+                    name:               grpFull?.name ?? groupId,
+                    telegram_chat_id:   chatId,
+                    telegram_chat_name: grpFull?.telegram_chat_name ?? null,
+                    group_type:         "open" as const,
+                    group_members:      members,
+                  },
+                };
+
+                const dispatchedAt = new Date();
+                const alreadySent  = new Set<string>();
+                const results      = await processMembersOf(scheduleStub as any, alreadySent);
+
+                const sentForMonitor = results
+                  .filter((r) => r.status === "sent")
+                  .map((r) => {
+                    const member = members.find((m) => m.accounts?.id === r.account_id);
+                    return { account_id: r.account_id, message_text: member?.message_text ?? "" };
+                  })
+                  .filter((r) => r.message_text);
+
+                if (sentForMonitor.length > 0) {
+                  monitorPositions(chatId, sentForMonitor, scheduleStub.id, dispatchedAt, "open")
+                    .catch((err) => console.error("[listen] Erro no monitoramento:", err.message));
+                }
+
+                const sent = results.filter((r) => r.status === "sent").length;
+                console.log(`[listen] ✓ Disparo manual concluído para grupo ${groupId}: ${sent} enviadas`);
+                return;
+              }
+            } catch (err: any) {
+              if (!ctrl.signal.aborted) {
+                console.warn(`[listen] Erro ao buscar histórico para ${groupId}: ${err.message}`);
+              }
+            }
+
+            if (!ctrl.signal.aborted) {
+              await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
+            }
+          }
+
+          if (ctrl.signal.aborted) {
+            console.log(`[listen] ⏹ Escuta abortada para grupo ${groupId}`);
+          } else {
             console.warn(`[listen] ⏰ Timeout — nenhum OK recebido para grupo ${groupId}`);
             await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
           }
-
+          listenMap.delete(groupId);
         } catch (err: any) {
           console.error(`[listen] Erro inesperado para grupo ${groupId}:`, err.message);
           listenMap.delete(groupId);
