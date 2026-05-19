@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v7 — insert do dispatch_log em background + queries iniciais em paralelo
+// v8 — 0ms dispatch: pre-fetch de schedule 800ms antes do fire + skip alreadySent em ciclos frescos
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -18,6 +18,7 @@ const RETRY_BUDGET_MS        = 50_000;
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
+const PREFETCH_BEFORE_MS     = 800;   // pre-carrega schedule N ms antes do fire
 
 // Monitoramento de posição
 const MONITOR_DELAY_CLOSED_MS     = 6_000;
@@ -78,6 +79,20 @@ interface MemberResult {
 /* ─── Peer cache ─── */
 const peerCache    = new Map<string, unknown>();
 const accountCache = new Map<string, Account>();
+
+/* ─── Pre-fetch cache (0-latency dispatch) ─── */
+const schedulePrefetchCache = new Map<string, Schedule>();
+const prefetchTimers        = new Map<string, ReturnType<typeof setTimeout>>();
+
+/* Query reutilizada no pre-fetch e no fallback de fireSchedule */
+const SCHEDULE_SELECT = `
+  id, cron_expression, user_id, group_id, next_run_at,
+  retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
+  retry_count, retry_until, last_attempt_at,
+  groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
+    group_members(id, message_text, position, is_active,
+      accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
+`.trim();
 
 /* ─── Resolve peer com múltiplos fallbacks ─── */
 async function getOrResolvePeer(
@@ -292,6 +307,10 @@ const clientPool = new TelegramClientPool();
 /* ─── Graceful shutdown ─── */
 async function shutdown() {
   console.log("[worker] Encerrando...");
+  for (const t of prefetchTimers.values()) clearTimeout(t);
+  prefetchTimers.clear();
+  for (const t of scheduledTimers.values()) clearTimeout(t);
+  scheduledTimers.clear();
   httpServer.close();
   await clientPool.disconnectAll();
   process.exit(0);
@@ -870,34 +889,31 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const now    = new Date();
   const nowISO = now.toISOString();
 
-  // Busca schedule e deduplicação em paralelo — economiza ~60ms
-  const [scheduleResult, _] = await Promise.all([
-    supabase
+  // Usa dados pré-carregados (caminho 0-latência) — fallback para busca ao vivo
+  let prefetched = schedulePrefetchCache.get(scheduleId);
+  schedulePrefetchCache.delete(scheduleId);
+
+  const schedule = await (async () => {
+    if (prefetched) {
+      console.log(`[timer] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
+      return prefetched;
+    }
+    const { data: rows, error } = await supabase
       .from("schedules")
-      .select(`
-        id, cron_expression, user_id, group_id, next_run_at,
-        retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
-        retry_count, retry_until, last_attempt_at,
-        groups(id, name, telegram_chat_id, telegram_chat_name, group_type,
-          group_members(id, message_text, position, is_active,
-            accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)))
-      `)
+      .select(SCHEDULE_SELECT)
       .eq("id", scheduleId)
       .eq("is_active", true)
-      .single(),
-    // Aquece a conexão Supabase em paralelo (sem usar o resultado aqui)
-    supabase.from("schedules").select("id").eq("id", scheduleId).limit(1),
-  ]);
+      .single();
+    if (error || !rows) return null;
+    return rows as unknown as Schedule;
+  })();
 
-  const { data: rows, error } = scheduleResult;
-
-  if (error || !rows) {
+  if (!schedule) {
     console.warn(`[timer] Schedule ${scheduleId} não encontrado ou inativo.`);
     return;
   }
 
-  const schedule = rows as unknown as Schedule;
-  const group    = schedule.groups;
+  const group = schedule.groups;
 
   if (!group?.telegram_chat_id) {
     console.warn(`[timer] Schedule ${scheduleId}: sem telegram_chat_id, pulando.`);
@@ -943,8 +959,12 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
-  // Busca deduplicação em paralelo com o que já sabemos que vem a seguir
-  const alreadySent = await getAlreadySentAccountIds(schedule);
+  // Em ciclos frescos (sem retry_until) não há nada enviado ainda —
+  // skip da query de dedup elimina ~100ms do caminho crítico.
+  const alreadySent = schedule.retry_until
+    ? await getAlreadySentAccountIds(schedule)
+    : new Set<string>();
+
   if (alreadySent.size > 0) {
     console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — serão pulados.`);
   }
@@ -1063,7 +1083,44 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
 
+  // Limpa pre-fetch anterior se houver
+  const existingPrefetch = prefetchTimers.get(scheduleId);
+  if (existingPrefetch) { clearTimeout(existingPrefetch); prefetchTimers.delete(scheduleId); }
+
   const effectiveDelay = Math.max(0, delay);
+
+  // Pre-fetch: carrega o schedule no cache PREFETCH_BEFORE_MS antes do fire.
+  // Quando fireSchedule rodar, não há nenhuma query bloqueante no caminho crítico.
+  if (effectiveDelay > PREFETCH_BEFORE_MS) {
+    const pt = setTimeout(async () => {
+      prefetchTimers.delete(scheduleId);
+      try {
+        const { data, error } = await supabase
+          .from("schedules")
+          .select(SCHEDULE_SELECT)
+          .eq("id", scheduleId)
+          .eq("is_active", true)
+          .single();
+        if (error || !data) {
+          console.warn(`[prefetch] Schedule ${scheduleId} inativo ou removido — ignorando`);
+          return;
+        }
+        const s = data as unknown as Schedule;
+        // Injeta contas do accountCache (mais frescos)
+        if (s.groups?.group_members) {
+          s.groups.group_members = s.groups.group_members.map((m) => ({
+            ...m,
+            accounts: m.accounts ? (accountCache.get(m.accounts.id) ?? m.accounts) : null,
+          }));
+        }
+        schedulePrefetchCache.set(scheduleId, s);
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
+      } catch (err: any) {
+        console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
+      }
+    }, effectiveDelay - PREFETCH_BEFORE_MS);
+    prefetchTimers.set(scheduleId, pt);
+  }
 
   const timer = setTimeout(async () => {
     scheduledTimers.delete(scheduleId);
