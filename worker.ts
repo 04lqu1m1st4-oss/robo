@@ -129,6 +129,28 @@
 //     - FloodWait por conta: a conta afetada pausa individualmente
 //     - updateScheduleAfterDispatch roda uma única vez no final
 //     - Resultado esperado: todas as contas chegam ao DC Telegram no mesmo ms
+//
+// Fix v12 (2025-06) — monitorPositions: posição real no histórico do grupo:
+//   BUG #I — posição calculada apenas entre as contas cadastradas:
+//     A lógica anterior usava o índice dentro de windowMsgs filtrados pelos
+//     textos das nossas contas (ourTexts). Isso dava posição 1, 2, 3... entre
+//     as nossas mensagens, ignorando todas as outras pessoas do grupo.
+//
+//   SOLUÇÃO — posição pelo message_id global do chat:
+//     message_id no Telegram é sequencial e global por chat. Para cada conta,
+//     buscamos sua mensagem no histórico pelo texto, pegamos o message_id, e
+//     contamos quantas mensagens na janela têm message_id menor — esse count+1
+//     é a posição real, levando em conta todos os participantes do grupo.
+//
+//   MUDANÇAS:
+//     - _savePositions(): nova helper que recebe windowMsgs ordenado por
+//       message_id crescente e calcula posição de cada conta pelo critério acima.
+//     - monitorPositions() grupo fechado: aguarda POST_DISPATCH_WAIT_MS=10s
+//       fixos, busca 200 mensagens uma única vez, calcula e salva posições.
+//     - monitorPositions() grupo aberto: mantém polling original, mas agora
+//       delega o cálculo de posição para _savePositions().
+//     - Zero impacto no caminho crítico: monitorPositions ainda é chamado
+//       em background via .catch() em todos os pontos de disparo.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -155,11 +177,9 @@ const LOOKAHEAD_MS                  = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS         = 45_000;
 const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
-const MONITOR_DELAY_CLOSED_MS       = 6_000;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
 const MONITOR_POLL_MS               = 5_000;
 const LISTEN_POLL_MS                = 400;
-const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 const SNIPER_BEFORE_MS              = 45;
@@ -169,6 +189,13 @@ const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
+
+// Monitor v12: aguarda N segundos após disparo para capturar histórico completo do leilão
+const MONITOR_POST_DISPATCH_WAIT_MS = 10_000;
+// Quantas mensagens buscar no histórico para calcular posição
+const MONITOR_HISTORY_FETCH_LIMIT   = 200;
+// Janela de tempo antes do disparo para delimitar início da janela de busca
+const MONITOR_WINDOW_BEFORE_MS      = 5_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -957,7 +984,58 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   MONITORAMENTO DE POSIÇÃO
+   MONITOR — HELPER INTERNO: calcula e persiste posições reais
+   windowMsgs deve estar ordenado por message_id crescente (ordem de chegada).
+   Posição = quantas mensagens na janela têm message_id < o meu + 1.
+   Isso conta TODOS os participantes do grupo, não só as nossas contas.
+   ───────────────────────────────────────────────────────────────────────────── */
+async function _savePositions(
+  sentMembers: Array<{ account_id: string; message_text: string }>,
+  windowMsgs: any[],  // já ordenado por m.id crescente
+  scheduleId: string,
+  dispatchedAt: Date,
+): Promise<void> {
+  const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
+
+  await Promise.allSettled(sentMembers.map(sm => {
+    if (!sm.message_text) return;
+
+    // Localiza esta mensagem no histórico pelo texto
+    const myMsgIndex = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
+    if (myMsgIndex < 0) {
+      console.warn(`[monitor] Mensagem não encontrada no histórico para conta ${sm.account_id}`);
+      return;
+    }
+
+    const myMsgId = windowMsgs[myMsgIndex].id as number;
+
+    // Posição real: quantas mensagens chegaram antes da nossa (message_id menor) + 1
+    // message_id é sequencial e global por chat no Telegram — não depende de timestamp
+    const position = windowMsgs.filter((m: any) => (m.id as number) < myMsgId).length + 1;
+
+    console.log(
+      `[monitor] ${sm.account_id}: posição #${position} ` +
+      `(msg_id=${myMsgId}, total na janela=${windowMsgs.length})`
+    );
+
+    return supabase.from("dispatch_logs")
+      .update({ position_rank: position })
+      .eq("schedule_id", scheduleId)
+      .eq("account_id", sm.account_id)
+      .eq("status", "sent")
+      .gte("sent_at", cutoff);
+  }));
+
+  console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId}`);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   MONITORAMENTO DE POSIÇÃO (v12)
+   — Grupo fechado: aguarda MONITOR_POST_DISPATCH_WAIT_MS após o disparo,
+     busca MONITOR_HISTORY_FETCH_LIMIT mensagens do histórico uma única vez,
+     ordena por message_id crescente e delega para _savePositions().
+   — Grupo aberto: mantém polling original; delega cálculo para _savePositions().
+   — Zero impacto no caminho crítico: sempre chamado em background via .catch().
    ───────────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
@@ -969,72 +1047,96 @@ async function monitorPositions(
   if (sentMembers.length === 0) return;
 
   const account = accountCache.get(sentMembers[0].account_id);
-  if (!account) { console.warn("[monitor] Conta não encontrada no cache — ignorando"); return; }
+  if (!account) {
+    console.warn("[monitor] Conta não encontrada no cache — ignorando");
+    return;
+  }
 
   const client = await getClient(account).catch(() => null);
-  if (!client) { console.warn("[monitor] Sem client — ignorando monitoramento"); return; }
+  if (!client) {
+    console.warn("[monitor] Sem client — ignorando monitoramento");
+    return;
+  }
 
-  const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
-  const deadline        = Date.now() + (groupType === "closed"
-    ? MONITOR_DELAY_CLOSED_MS + 10_000
-    : MONITOR_MAX_OPEN_MS);
+  // Limite inferior da janela de busca: MONITOR_WINDOW_BEFORE_MS antes do disparo
+  const windowStartUnix = Math.floor(
+    (dispatchedAt.getTime() - MONITOR_WINDOW_BEFORE_MS) / 1000
+  );
+
+  // ── Grupo fechado: busca única após wait fixo ─────────────────────────
+  if (groupType === "closed") {
+    console.log(
+      `[monitor] ⏳ Aguardando ${MONITOR_POST_DISPATCH_WAIT_MS / 1000}s ` +
+      `para capturar histórico completo do leilão (schedule ${scheduleId})`
+    );
+    await new Promise(r => setTimeout(r, MONITOR_POST_DISPATCH_WAIT_MS));
+
+    try {
+      const peer   = await resolvePeer(client, telegramChatId, account.id);
+      const result = await client.invoke(
+        new Api.messages.GetHistory({
+          peer:       peer as any,
+          limit:      MONITOR_HISTORY_FETCH_LIMIT,
+          offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+          hash:       bigInt(0), addOffset: 0,
+        })
+      ) as any;
+
+      // Filtra mensagens na janela e ordena por message_id crescente
+      // (message_id sequencial = ordem exata de chegada no Telegram)
+      const windowMsgs: any[] = (result.messages ?? [])
+        .filter((m: any) => m._ === "message" && (m.date as number) >= windowStartUnix)
+        .sort((a: any, b: any) => (a.id as number) - (b.id as number));
+
+      if (windowMsgs.length === 0) {
+        console.warn(`[monitor] Nenhuma mensagem na janela (closed) — schedule ${scheduleId}`);
+        return;
+      }
+
+      console.log(
+        `[monitor] ${windowMsgs.length} msg(s) na janela para schedule ${scheduleId} (closed)`
+      );
+      await _savePositions(sentMembers, windowMsgs, scheduleId, dispatchedAt);
+
+    } catch (err: any) {
+      console.warn(`[monitor] Erro ao buscar histórico (closed): ${err.message}`);
+    }
+    return;
+  }
+
+  // ── Grupo aberto: polling até encontrar nossas mensagens ──────────────
   const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
+  const deadline = Date.now() + MONITOR_MAX_OPEN_MS;
 
-  if (groupType === "closed") await new Promise(r => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
-
-  console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType})`);
+  console.log(`[monitor] Iniciando polling para schedule ${scheduleId} (open)`);
 
   while (Date.now() < deadline) {
     try {
       const peer   = await resolvePeer(client, telegramChatId, account.id);
       const result = await client.invoke(
         new Api.messages.GetHistory({
-          peer: peer as any,
-          limit: MONITOR_HISTORY_LIMIT,
+          peer:       peer as any,
+          limit:      MONITOR_HISTORY_FETCH_LIMIT,
           offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-          hash: bigInt(0), addOffset: 0,
+          hash:       bigInt(0), addOffset: 0,
         })
       ) as any;
 
-      const windowMsgs = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-        .reverse();
+      // Filtra janela e ordena por message_id crescente
+      const windowMsgs: any[] = (result.messages ?? [])
+        .filter((m: any) => m._ === "message" && (m.date as number) >= windowStartUnix)
+        .sort((a: any, b: any) => (a.id as number) - (b.id as number));
 
-      if (windowMsgs.length === 0) {
-        if (groupType === "closed") {
-          console.warn("[monitor] Sem mensagens na janela (grupo fechado) — abortando");
-          return;
-        }
+      if (windowMsgs.length === 0 || !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
 
-      if (groupType === "open" && !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
-        await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
-        continue;
-      }
-
-      const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
-      await Promise.allSettled(sentMembers.map(sm => {
-        if (!sm.message_text) return;
-        const idx = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
-        if (idx < 0) return;
-        const rank = idx + 1;
-        console.log(`[monitor] ${sm.account_id}: posição #${rank} em ${telegramChatId}`);
-        return supabase.from("dispatch_logs")
-          .update({ position_rank: rank })
-          .eq("schedule_id", scheduleId)
-          .eq("account_id", sm.account_id)
-          .eq("status", "sent")
-          .gte("sent_at", cutoff);
-      }));
-
-      console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId}`);
+      await _savePositions(sentMembers, windowMsgs, scheduleId, dispatchedAt);
       return;
 
     } catch (err: any) {
-      console.warn(`[monitor] Erro ao buscar histórico: ${err.message}`);
-      if (groupType === "closed") return;
+      console.warn(`[monitor] Erro ao buscar histórico (open): ${err.message}`);
       await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
     }
   }
