@@ -2056,7 +2056,7 @@ const httpServer = http.createServer(async (req, res) => {
           }
 
           const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
-          const client  = await getClient(account);
+          let client   = await getClient(account);
 
           const deadline    = Date.now() + 2 * 60 * 60_000;
           const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
