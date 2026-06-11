@@ -1,4 +1,4 @@
-// worker-flat.ts — dispatch worker Telegram, sem nenhuma camadas de abstração
+// worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
 //
 // Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
 //         roda enquanto fireSchedule ainda está executando (race condition
@@ -2067,6 +2067,12 @@ const httpServer = http.createServer(async (req, res) => {
 
           while (Date.now() < deadline && !ctrl.signal.aborted) {
             try {
+              if (!client.connected) {
+                console.warn(`[listen-manual] Client desconectou — reconectando para grupo ${groupId}`);
+                client = await getClient(account);
+                try { await resolvePeer(client, chatId, account.id); } catch {}
+              }
+
               const peer   = await resolvePeer(client, chatId, account.id);
               const result = await client.invoke(
                 new Api.messages.GetHistory({
@@ -2078,7 +2084,7 @@ const httpServer = http.createServer(async (req, res) => {
 
               const recentMsgs = (result.messages ?? []).filter(
                 (m: any) =>
-                  (m.className === "Message" || m._ === "message") &&
+                  (m._ === "message" || m.className === "Message") &&
                   m.date >= startUnix &&
                   m.id > lastSeenMsgId
               );
@@ -2088,7 +2094,9 @@ const httpServer = http.createServer(async (req, res) => {
 
               const gotSignal = recentMsgs.some((m: any) => {
                 const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
-                const hasMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+                const hasMedia = m.media != null &&
+                  m.media._ !== "messageMediaEmpty" &&
+                  m.media.className !== "MessageMediaEmpty";
                 return hasText || hasMedia;
               });
 
