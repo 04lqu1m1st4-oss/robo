@@ -179,7 +179,7 @@ const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
 const MONITOR_POLL_MS               = 5_000;
-const LISTEN_POLL_MS                = 400;
+const LISTEN_POLL_MS                = 1;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 const SNIPER_BEFORE_MS              = 45;
@@ -1199,9 +1199,9 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           }
 
           const gotSignal = recentMsgs.some((m: any) => {
-            const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
-            const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-            return isOk || isMedia;
+            const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
+            const hasMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+            return hasText || hasMedia;
           });
 
           if (gotSignal && !ctrl.signal.aborted) {
@@ -1209,8 +1209,7 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             listenMap.delete(group.id);
 
             const dispatchedAt = new Date();
-            const alreadySent  = await getAlreadySentIds(schedule);
-            const results      = await dispatchToGroup(schedule, group, alreadySent);
+            const results      = await dispatchToGroup(schedule, group, new Set());
 
             const sentForMonitor = results
               .filter(r => r.status === "sent")
@@ -2088,8 +2087,9 @@ const httpServer = http.createServer(async (req, res) => {
               }
 
               const gotSignal = recentMsgs.some((m: any) => {
-                const text = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
-                return text === "ok" || (m.media != null && m.media.className !== "MessageMediaEmpty");
+                const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
+                const hasMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+                return hasText || hasMedia;
               });
 
               if (gotSignal && !ctrl.signal.aborted) {
