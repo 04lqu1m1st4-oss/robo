@@ -1,4 +1,4 @@
-// worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
+// worker-flat.ts — dispatch worker Telegram, sem nenhuma camadas de abstração
 //
 // Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
 //         roda enquanto fireSchedule ainda está executando (race condition
