@@ -1480,16 +1480,19 @@ async function fireSchedule(scheduleId: string): Promise<void> {
         return;
       }
 
-      const firstAccount = (group.group_members ?? [])
-        .filter(m => m.is_active && m.accounts?.is_active)
+      // Listener deve ser a conta que de fato envia mensagem (message_text preenchido),
+      // não simplesmente a de menor position — contas só de monitoramento (sem
+      // message_text) não devem ficar "ouvindo" o sinal do admin.
+      const listenerAccount = (group.group_members ?? [])
+        .filter(m => m.is_active && m.accounts?.is_active && m.message_text)
         .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
 
-      if (!firstAccount) {
-        console.warn(`[fire] Nenhuma conta ativa no grupo — abortando.`);
+      if (!listenerAccount) {
+        console.warn(`[fire] Nenhuma conta com mensagem configurada no grupo — abortando.`);
         return;
       }
 
-      startGroupListener(schedule, group, firstAccount as Account);
+      startGroupListener(schedule, group, listenerAccount as Account);
 
       await supabase.from("schedules").update({
         retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
