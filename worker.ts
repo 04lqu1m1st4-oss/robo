@@ -1230,9 +1230,11 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           }
 
           const gotSignal = recentMsgs.some((m: any) => {
-            const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
+            // Qualquer texto não vazio ("ok", emoji digitado, qualquer palavra) ou
+            // mídia (sticker, gif, foto, etc.) enviado pelo admin conta como sinal.
+            const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
             const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-            return isOk || isMedia;
+            return hasText || isMedia;
           });
 
           if (gotSignal && !ctrl.signal.aborted) {
