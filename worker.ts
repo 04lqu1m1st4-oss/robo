@@ -179,7 +179,7 @@ const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
 const MONITOR_POLL_MS               = 5_000;
-const LISTEN_POLL_MS                = 400;
+const LISTEN_POLL_MS                = 3_000;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 const SNIPER_BEFORE_MS              = 45;
@@ -1188,13 +1188,36 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           }
 
           const peer   = await resolvePeer(client, group.telegram_chat_id!, account.id);
-          const result = await client.invoke(
-            new Api.messages.GetHistory({
-              peer: peer as any, limit: 10,
-              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-              hash: bigInt(0), addOffset: 0,
-            })
-          ) as any;
+
+          let result: any;
+          try {
+            result = await client.invoke(
+              new Api.messages.GetHistory({
+                peer: peer as any, limit: 10,
+                offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+                hash: bigInt(0), addOffset: 0,
+              })
+            );
+          } catch (err: any) {
+            const errMsg = String(err?.message ?? "");
+            const isFlood =
+              err?.seconds != null ||
+              err?.constructor?.name === "FloodWaitError" ||
+              /flood/i.test(errMsg);
+
+            if (isFlood) {
+              const waitSecs = typeof err.seconds === "number"
+                ? err.seconds
+                : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "30", 10);
+              console.warn(`[listen] FloodWait ${waitSecs}s no GetHistory (${schedule.id}) — pausando o tempo exato`);
+              if (!ctrl.signal.aborted) {
+                await new Promise(r => setTimeout(r, waitSecs * 1000));
+              }
+              continue;
+            }
+
+            throw err;
+          }
 
           const recentMsgs = (result.messages ?? []).filter(
             (m: any) =>
