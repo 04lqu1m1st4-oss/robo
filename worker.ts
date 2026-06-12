@@ -151,6 +151,38 @@
 //       delega o cálculo de posição para _savePositions().
 //     - Zero impacto no caminho crítico: monitorPositions ainda é chamado
 //       em background via .catch() em todos os pontos de disparo.
+//
+// Fix v13 (2025-06) — detecção de sinal universalizada nos listeners de grupo aberto:
+//   BUG #J — listener não dispara com emoji, GIF, sticker, mídia sem texto:
+//     A lógica anterior de gotSignal exigia m.message (texto) OR m.media !=
+//     null e != MessageMediaEmpty. Porém:
+//       - Emojis animados (messageMediaUnsupported) caíam no ramo de mídia
+//         mas podiam ser undefined em algumas versões da biblioteca.
+//       - Stickers são messageMediaDocument sem m.message.
+//       - GIFs são messageMediaDocument com atributo DocumentAttributeAnimated.
+//       - Reações de emoji no topo de mensagem chegam como messageService
+//         e não como "message" → eram filtrados pelo className/_ check.
+//       - Qualquer mensagem cujo className não fosse exatamente "Message" ou
+//         cujo _ não fosse "message" era silenciosamente ignorada.
+//
+//   SOLUÇÃO — hasAnyContent(): helper unificado que retorna true para qualquer
+//     item do histórico que represente atividade de usuário:
+//       - Mensagens de texto (m.message com conteúdo)
+//       - Qualquer mídia não-vazia (foto, documento, sticker, GIF, vídeo,
+//         áudio, voz, localização, contato, etc.)
+//       - Mensagens de serviço (messageService) — pin, entrada, etc.
+//       — Adicionalmente, aceita m._ === "message" OU m.className === "Message"
+//         OU m._ === "messageService" OU m.className === "MessageService"
+//         para cobrir todas as versões e variantes da biblioteca gramjs.
+//
+//   A mesma lógica foi aplicada em:
+//     - startGroupListener() (schedule automático de grupo aberto)
+//     - listen-manual HTTP handler (botão manual)
+//     Garantindo comportamento idêntico nas duas rotas.
+//
+//   TAMBÉM: Listener de grupo aberto agora é iniciado automaticamente pelo
+//     scheduleTimer/fireSchedule no horário do schedule — sem necessidade de
+//     ação manual. O frontend remove o botão "Aguardar OK".
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -347,6 +379,41 @@ function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
   return bigInt(hi).shiftLeft(32).add(bigInt(lo));
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   HELPER: detecção de sinal universalizada (v13)
+   Retorna true para qualquer item do histórico GetHistory que represente
+   atividade real de usuário — texto, emoji, sticker, GIF, foto, vídeo,
+   áudio, voz, documento, localização, contato, mensagem de serviço, etc.
+   ───────────────────────────────────────────────────────────────────────────── */
+function hasAnyContent(m: any): boolean {
+  if (!m) return false;
+
+  const cls = m.className ?? "";
+  const _   = m._ ?? "";
+
+  // Mensagens de serviço (pin, entrada no grupo, etc.) — contam como atividade
+  if (cls === "MessageService" || _ === "messageService") return true;
+
+  // Aceita tanto "Message" (className) quanto "message" (_ field)
+  const isMsg = cls === "Message" || _ === "message";
+  if (!isMsg) return false;
+
+  // Texto presente e não-vazio (inclui emojis de texto puro)
+  if (typeof m.message === "string" && m.message.trim().length > 0) return true;
+
+  // Qualquer mídia não-vazia:
+  //   sticker, GIF, foto, vídeo, áudio, voz, documento, localização, contato,
+  //   emoji animado (messageMediaUnsupported em algumas versões), etc.
+  if (m.media != null) {
+    const mc  = m.media.className ?? "";
+    const m_  = m.media._ ?? "";
+    const isEmpty = mc === "MessageMediaEmpty" || m_ === "messageMediaEmpty";
+    if (!isEmpty) return true;
+  }
+
+  return false;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1146,6 +1213,11 @@ async function monitorPositions(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    LISTENER DE GRUPO ABERTO
+   Agora iniciado automaticamente pelo scheduleTimer/fireSchedule no horário
+   do schedule — sem necessidade de ação manual do frontend.
+   Detecção de sinal universalizada: aceita texto, emoji, sticker, GIF,
+   foto, vídeo, áudio, voz, documento, localização, contato e mensagens de
+   serviço — via hasAnyContent() (Fix v13).
    ───────────────────────────────────────────────────────────────────────────── */
 function startGroupListener(schedule: Schedule, group: Group, account: Account): void {
   const existing = listenMap.get(group.id);
@@ -1190,7 +1262,6 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
 
           const recentMsgs = (result.messages ?? []).filter(
             (m: any) =>
-              (m.className === "Message" || m._ === "message") &&
               m.date >= startUnix &&
               m.id > lastSeenMsgId
           );
@@ -1198,11 +1269,8 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
           }
 
-          const gotSignal = recentMsgs.some((m: any) => {
-            const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
-            const hasMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-            return hasText || hasMedia;
-          });
+          // v13: usa hasAnyContent() — detecta texto, emoji, sticker, GIF, mídia, serviço
+          const gotSignal = recentMsgs.some((m: any) => hasAnyContent(m));
 
           if (gotSignal && !ctrl.signal.aborted) {
             console.log(`[listen] ✓ Sinal detectado — disparando schedule ${schedule.id}`);
@@ -1480,6 +1548,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
         return;
       }
 
+      // Inicia o listener automaticamente (sem necessidade de ação manual)
       startGroupListener(schedule, group, firstAccount as Account);
 
       await supabase.from("schedules").update({
@@ -1488,6 +1557,15 @@ async function fireSchedule(scheduleId: string): Promise<void> {
         last_attempt_status: "waiting_admin",
         last_attempt_error:  null,
       }).eq("id", scheduleId);
+
+      // Atualiza listener_session_id no banco para o frontend poder refletir estado
+      supabase.from("groups")
+        .update({ listener_session_id: `schedule-${scheduleId}-${Date.now()}` })
+        .eq("id", group.id)
+        .then(({ error: e }) => {
+          if (e) console.warn(`[fire] Falha ao atualizar listener_session_id:`, e.message);
+        });
+
       return;
     }
 
@@ -2084,7 +2162,6 @@ const httpServer = http.createServer(async (req, res) => {
 
               const recentMsgs = (result.messages ?? []).filter(
                 (m: any) =>
-                  (m._ === "message" || m.className === "Message") &&
                   m.date >= startUnix &&
                   m.id > lastSeenMsgId
               );
@@ -2092,13 +2169,8 @@ const httpServer = http.createServer(async (req, res) => {
                 lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
               }
 
-              const gotSignal = recentMsgs.some((m: any) => {
-                const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
-                const hasMedia = m.media != null &&
-                  m.media._ !== "messageMediaEmpty" &&
-                  m.media.className !== "MessageMediaEmpty";
-                return hasText || hasMedia;
-              });
+              // v13: usa hasAnyContent() — detecta qualquer tipo de mensagem/mídia
+              const gotSignal = recentMsgs.some((m: any) => hasAnyContent(m));
 
               if (gotSignal && !ctrl.signal.aborted) {
                 console.log(`[listen-manual] ✓ Sinal detectado para grupo ${groupId}`);
