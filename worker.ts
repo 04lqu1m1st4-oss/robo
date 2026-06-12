@@ -1174,9 +1174,17 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         try {
           if (!client.connected) {
-            console.warn(`[listen] Client desconectou — reconectando para ${schedule.id}`);
-            client = await getClient(account);
-            try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
+            console.warn(`[listen] Client desconectado — aguardando autoReconnect (${schedule.id})`);
+            // dá tempo pro autoReconnect nativo do GramJS (autoReconnect: true) se recuperar
+            // sozinho, sem matar a conexão em andamento (evita loop de reconexão infinito)
+            for (let i = 0; i < 10 && !client.connected && !ctrl.signal.aborted; i++) {
+              await new Promise(r => setTimeout(r, 500));
+            }
+            if (!client.connected) {
+              console.warn(`[listen] autoReconnect não recuperou em 5s — forçando reloadClient (${schedule.id})`);
+              client = await reloadClient(account);
+              try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
+            }
           }
 
           const peer   = await resolvePeer(client, group.telegram_chat_id!, account.id);
