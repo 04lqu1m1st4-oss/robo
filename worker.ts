@@ -149,7 +149,7 @@ interface DispatchResult {
 const clients               = new Map<string, TelegramClient>();
 const sessions              = new Map<string, string>();
 const keepaliveTimers       = new Map<string, ReturnType<typeof setInterval>>();
-const peerCache             = new Map<string, unknown>();
+const peerCache             = new Map<string, object>();
 const accountCache          = new Map<string, Account>();
 const scheduledTimers       = new Map<string, ReturnType<typeof setTimeout>>();
 const prefetchTimers        = new Map<string, ReturnType<typeof setTimeout>>();
@@ -396,17 +396,17 @@ async function resolvePeer(
   client: TelegramClient,
   telegramChatId: string,
   accountId: string
-): Promise<unknown> {
+): Promise<object> {
   const key = `${accountId}:${telegramChatId}`;
-  if (peerCache.has(key)) return peerCache.get(key)!;
+  if (peerCache.has(key)) return peerCache.get(key) as object;
 
   const chatIdNum = parseInt(telegramChatId, 10);
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
   try {
     const peer = await client.getInputEntity(chatIdNum);
-    peerCache.set(key, peer);
-    return peer;
+    peerCache.set(key, peer as object);
+    return peer as object;
   } catch {}
 
   const absId     = Math.abs(chatIdNum);
@@ -428,14 +428,27 @@ async function resolvePeer(
   await client.getDialogs({ limit: 200 });
   try {
     const peer = await client.getInputEntity(chatIdNum);
-    peerCache.set(key, peer);
-    return peer;
+    peerCache.set(key, peer as object);
+    return peer as object;
   } catch (e: any) {
     throw new Error(
       `PEER_UNRESOLVABLE ${telegramChatId}: conta não é membro ou sessão inválida. ` +
       `Último erro: ${e.message}`
     );
   }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   HELPER: extrai chat ID numérico de um evento NewMessage (v14)
+   ───────────────────────────────────────────────────────────────────────────── */
+function getMsgChatId(msg: any): number {
+  if (msg.chatId?.toJSNumber) return msg.chatId.toJSNumber();
+  const peerId = msg.peerId;
+  if (!peerId) return 0;
+  if (peerId instanceof Api.PeerChannel) return peerId.channelId?.toJSNumber?.() ?? 0;
+  if (peerId instanceof Api.PeerChat)    return peerId.chatId?.toJSNumber?.()    ?? 0;
+  if (peerId instanceof Api.PeerUser)    return peerId.userId?.toJSNumber?.()    ?? 0;
+  return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -574,7 +587,7 @@ async function dispatchOpenGroup(
   schedule: Schedule,
   group: Group,
   warmClients: Map<string, TelegramClient>,   // accountId → client já conectado
-  warmPeers:   Map<string, unknown>,           // accountId → peer já resolvido
+  warmPeers:   Map<string, object>,           // accountId → peer já resolvido
 ): Promise<DispatchResult[]> {
   const members = (group.group_members ?? [])
     .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
@@ -592,7 +605,7 @@ async function dispatchOpenGroup(
       let client = warmClients.get(account.id) ?? null;
       let peer   = warmPeers.get(account.id)   ?? null;
 
-      const tryOnce = async (cl: TelegramClient, pr: unknown): Promise<void> => {
+      const tryOnce = async (cl: TelegramClient, pr: object): Promise<void> => {
         await Promise.race([
           cl.invoke(new Api.messages.SendMessage({
             peer:      pr as any,
@@ -1138,7 +1151,7 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         .sort((a, b) => a.position - b.position);
 
       const warmClients = new Map<string, TelegramClient>();
-      const warmPeers   = new Map<string, unknown>();
+      const warmPeers   = new Map<string, object>();
 
       // Não bloqueia o listener — aquece em paralelo
       Promise.allSettled(members.map(async m => {
@@ -1196,8 +1209,8 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         const msg = event.message;
         if (!msg) return;
 
-        // Filtra pelo chat correto
-        const msgChatId = msg.chatId?.toJSNumber?.() ?? msg.peerId?.channelId?.toJSNumber?.() ?? 0;
+        // Filtra pelo chat correto usando helper type-safe (FIX v14)
+        const msgChatId = getMsgChatId(msg);
         const absChat   = Math.abs(chatNum);
         const absMsg    = Math.abs(msgChatId);
         if (absMsg !== absChat && absMsg !== absChat - 1_000_000_000_000) return;
@@ -2085,7 +2098,7 @@ const httpServer = http.createServer(async (req, res) => {
 
           // Pre-aquece todas as contas
           const warmClients = new Map<string, TelegramClient>();
-          const warmPeers   = new Map<string, unknown>();
+          const warmPeers   = new Map<string, object>();
           Promise.allSettled(members.map(async m => {
             if (!m.accounts?.is_active) return;
             const acc = accountCache.get(m.accounts.id) ?? m.accounts as unknown as Account;
@@ -2154,12 +2167,12 @@ const httpServer = http.createServer(async (req, res) => {
             console.log(`[listen-manual] ✓ ${sent} mensagem(ns) enviada(s) via ${source} para grupo ${groupId}`);
           };
 
-          // Event handler
+          // Event handler — usa helper type-safe (FIX v14)
           const handler = async (event: NewMessageEvent) => {
             if (fired || ctrl.signal.aborted) return;
             const msg = event.message;
             if (!msg || (msg as any).date < startUnix) return;
-            const msgChatId = msg.chatId?.toJSNumber?.() ?? msg.peerId?.channelId?.toJSNumber?.() ?? 0;
+            const msgChatId = getMsgChatId(msg);
             const absChat   = Math.abs(chatNum);
             const absMsg    = Math.abs(msgChatId);
             if (absMsg !== absChat && absMsg !== absChat - 1_000_000_000_000) return;
