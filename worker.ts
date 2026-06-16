@@ -1255,12 +1255,14 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
 
           const gotSignal = recentMsgs.some((m: any) => {
             // Só conta como sinal se vier da conta monitorada (admin do grupo).
-            // Qualquer texto não vazio ("ok", emoji digitado, qualquer palavra) ou
-            // mídia (sticker, gif, foto, etc.) enviado por ELA conta como sinal.
+            // Texto curto (≤5 chars): "ok", "👍", "✅", emoji digitado, etc. → dispara.
+            // Texto longo (>5 chars): mensagem comum — ignora.
+            // Mídia (sticker, GIF, foto, etc.): sempre dispara.
             if (!isFromMonitoredAccount(m, group.trigger_account_id ?? null)) return false;
-            const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
+            const text = typeof m.message === "string" ? m.message.trim() : "";
+            const hasShortText = text.length > 0 && text.length <= 5;
             const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-            return hasText || isMedia;
+            return hasShortText || isMedia;
           });
 
           if (gotSignal && !ctrl.signal.aborted) {
@@ -2151,8 +2153,10 @@ const httpServer = http.createServer(async (req, res) => {
 
               const gotSignal = recentMsgs.some((m: any) => {
                 if (!isFromMonitoredAccount(m, (grpRow as any).trigger_account_id ?? null)) return false;
-                const text = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
-                return text === "ok" || (m.media != null && m.media.className !== "MessageMediaEmpty");
+                const text = typeof m.message === "string" ? m.message.trim() : "";
+                const hasShortText = text.length > 0 && text.length <= 5;
+                const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+                return hasShortText || isMedia;
               });
 
               if (gotSignal && !ctrl.signal.aborted) {
