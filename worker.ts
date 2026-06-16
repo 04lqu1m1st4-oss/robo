@@ -313,14 +313,14 @@ function isRetryableError(msg: string): boolean {
          !u.includes("SESSION_REVOKED");
 }
 
-// Fix v13 — sinal de grupo aberto deve vir da conta monitorada (admin), não de qualquer mensagem.
-function isFromMonitoredAccount(m: any, triggerAccountId: number | null): boolean {
-  if (triggerAccountId == null) return true; // grupo legado sem admin configurada — mantém comportamento antigo
-  const fromId = m.fromId;
-  if (!fromId) return false; // mensagem sem remetente identificável (anônima/canal) não conta como sinal
-  const senderId = fromId.userId ?? fromId.channelId ?? fromId.chatId;
-  if (senderId == null) return false;
-  return senderId.toString() === String(triggerAccountId);
+// Fix v13 (revisado) — sinal de grupo aberto: qualquer pessoa pode mandar,
+// mas só passa se texto tiver <= 5 chars (ok, emoji, etc.) ou for mídia.
+// Texto longo de qualquer um = ignora. Sem filtro de conta.
+function isSignalMessage(m: any): boolean {
+  const text = typeof m.message === "string" ? m.message.trim() : "";
+  const hasShortText = text.length > 0 && text.length <= 5;
+  const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+  return hasShortText || isMedia;
 }
 
 function nextWeeklyOccurrence(cron: string): string {
@@ -1253,17 +1253,7 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
           }
 
-          const gotSignal = recentMsgs.some((m: any) => {
-            // Só conta como sinal se vier da conta monitorada (admin do grupo).
-            // Texto curto (≤5 chars): "ok", "👍", "✅", emoji digitado, etc. → dispara.
-            // Texto longo (>5 chars): mensagem comum — ignora.
-            // Mídia (sticker, GIF, foto, etc.): sempre dispara.
-            if (!isFromMonitoredAccount(m, group.trigger_account_id ?? null)) return false;
-            const text = typeof m.message === "string" ? m.message.trim() : "";
-            const hasShortText = text.length > 0 && text.length <= 5;
-            const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-            return hasShortText || isMedia;
-          });
+          const gotSignal = recentMsgs.some((m: any) => isSignalMessage(m));
 
           if (gotSignal && !ctrl.signal.aborted) {
             console.log(`[listen] ✓ Sinal detectado — disparando schedule ${schedule.id}`);
@@ -2151,13 +2141,7 @@ const httpServer = http.createServer(async (req, res) => {
                 lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
               }
 
-              const gotSignal = recentMsgs.some((m: any) => {
-                if (!isFromMonitoredAccount(m, (grpRow as any).trigger_account_id ?? null)) return false;
-                const text = typeof m.message === "string" ? m.message.trim() : "";
-                const hasShortText = text.length > 0 && text.length <= 5;
-                const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-                return hasShortText || isMedia;
-              });
+              const gotSignal = recentMsgs.some((m: any) => isSignalMessage(m));
 
               if (gotSignal && !ctrl.signal.aborted) {
                 console.log(`[listen-manual] ✓ Sinal detectado para grupo ${groupId}`);
