@@ -151,6 +151,19 @@
 //       delega o cálculo de posição para _savePositions().
 //     - Zero impacto no caminho crítico: monitorPositions ainda é chamado
 //       em background via .catch() em todos os pontos de disparo.
+//
+// Fix v13 (2026-06) — sinal de grupo aberto só pode vir da conta monitorada:
+//   BUG #J — startGroupListener() e o listener manual disparavam com a
+//     mensagem de QUALQUER pessoa no grupo, não só da admin/conta monitorada
+//     (trigger_account_id). Isso causava disparo prematuro por mensagem de
+//     terceiros no grupo aberto.
+//
+//   SOLUÇÃO — isFromMonitoredAccount() filtra recentMsgs pelo fromId.userId
+//     (ou channelId/chatId) comparado a group.trigger_account_id antes de
+//     considerar texto/mídia como sinal. trigger_account_id agora é
+//     selecionado em SCHEDULE_SELECT e no select do listener manual.
+//     Grupos legados sem trigger_account_id mantêm o comportamento antigo
+//     (qualquer mensagem) para não quebrar configurações existentes.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -227,6 +240,7 @@ interface Group {
   telegram_chat_id: string | null;
   telegram_chat_name: string | null;
   group_type: "open" | "closed";
+  trigger_account_id: number | null;
   group_members: GroupMember[];
 }
 
@@ -279,7 +293,7 @@ const SCHEDULE_SELECT = `
   retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
   retry_count, retry_until, last_attempt_at,
   groups(
-    id, name, telegram_chat_id, telegram_chat_name, group_type,
+    id, name, telegram_chat_id, telegram_chat_name, group_type, trigger_account_id,
     group_members(
       id, message_text, position, is_active,
       accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)
@@ -297,6 +311,16 @@ function isRetryableError(msg: string): boolean {
          !u.includes("AUTH_KEY_DUPLICATED") &&
          !u.includes("USER_DEACTIVATED") &&
          !u.includes("SESSION_REVOKED");
+}
+
+// Fix v13 — sinal de grupo aberto deve vir da conta monitorada (admin), não de qualquer mensagem.
+function isFromMonitoredAccount(m: any, triggerAccountId: number | null): boolean {
+  if (triggerAccountId == null) return true; // grupo legado sem admin configurada — mantém comportamento antigo
+  const fromId = m.fromId;
+  if (!fromId) return false; // mensagem sem remetente identificável (anônima/canal) não conta como sinal
+  const senderId = fromId.userId ?? fromId.channelId ?? fromId.chatId;
+  if (senderId == null) return false;
+  return senderId.toString() === String(triggerAccountId);
 }
 
 function nextWeeklyOccurrence(cron: string): string {
@@ -1230,8 +1254,10 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           }
 
           const gotSignal = recentMsgs.some((m: any) => {
+            // Só conta como sinal se vier da conta monitorada (admin do grupo).
             // Qualquer texto não vazio ("ok", emoji digitado, qualquer palavra) ou
-            // mídia (sticker, gif, foto, etc.) enviado pelo admin conta como sinal.
+            // mídia (sticker, gif, foto, etc.) enviado por ELA conta como sinal.
+            if (!isFromMonitoredAccount(m, group.trigger_account_id ?? null)) return false;
             const hasText  = typeof m.message === "string" && m.message.trim().length > 0;
             const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
             return hasText || isMedia;
@@ -2071,7 +2097,7 @@ const httpServer = http.createServer(async (req, res) => {
           const { data: grpRow } = await supabase
             .from("groups")
             .select(`
-              id, telegram_chat_id, group_type,
+              id, telegram_chat_id, group_type, trigger_account_id,
               group_members(id, message_text, position, is_active,
                 accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
             `)
@@ -2124,6 +2150,7 @@ const httpServer = http.createServer(async (req, res) => {
               }
 
               const gotSignal = recentMsgs.some((m: any) => {
+                if (!isFromMonitoredAccount(m, (grpRow as any).trigger_account_id ?? null)) return false;
                 const text = typeof m.message === "string" ? m.message.trim().toLowerCase() : "";
                 return text === "ok" || (m.media != null && m.media.className !== "MessageMediaEmpty");
               });
