@@ -2167,12 +2167,13 @@ const httpServer = http.createServer(async (req, res) => {
                   retry_until:                null,
                   last_attempt_at:            null,
                   groups: {
-                    id:                 groupId,
-                    name:               grpFull?.name ?? groupId,
-                    telegram_chat_id:   chatId,
-                    telegram_chat_name: grpFull?.telegram_chat_name ?? null,
-                    group_type:         "open" as const,
-                    group_members:      members,
+                    id:                   groupId,
+                    name:                 grpFull?.name ?? groupId,
+                    telegram_chat_id:     chatId,
+                    telegram_chat_name:   grpFull?.telegram_chat_name ?? null,
+                    group_type:           "open" as const,
+                    trigger_account_id:   null,
+                    group_members:        members,
                   },
                 };
 
