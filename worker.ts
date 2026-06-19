@@ -36,134 +36,143 @@
 //
 // Fix v6 (2025-05) — correções de bugs críticos:
 //
-//   BUG #A — duplo disparo sniper + fireSchedule no mesmo ciclo:
-//     Ao terminar (sucesso ou falha), sniperFireClosed() registra o scheduleId
-//     em firingNow com TTL de 60s. Isso bloqueia o fireSchedule do mesmo ciclo
-//     que ainda está pendente no setTimeout.
+//   BUG #A — duplo disparo sniper + fireSchedule no mesmo ciclo
+//   BUG #B — groupType perdido após o 1º ciclo
+//   BUG #C — FloodWait no sniper gera ~30.000 chamadas em 30s
+//   BUG #D — reloadClient() deleta mutex sem await da promise inflight
+//   BUG #E — prewarmAccounts() a cada 30s chama getDialogs em todas as contas
+//   BUG #F — makeRandomId com entropia insuficiente
+//   BUG #G — keepalive sem jitter
 //
-//   BUG #B — groupType perdido após o 1º ciclo:
-//     updateScheduleAfterDispatch() agora recebe e repassa groupType para
-//     scheduleTimer(). Sem isso, grupos fechados perdiam o sniper silenciosamente
-//     a partir do 2º ciclo.
+// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS
+// Fix v8 (2025-05) — randomId estável por ciclo de tentativas
+// Fix v9 (2025-05) — 3 fixes cirúrgicos sobre o v8 original
+// Fix v10 (2025-05) — fase 2 paralela
+// Fix v11 (2025-05) — loop unificado: todas as contas em paralelo desde o início
+// Fix v12 (2025-06) — monitorPositions: posição real no histórico do grupo
+// Fix v13 (2025-06) — peer pré-resolvido no slot
+// Fix v14 (2025-06) — scheduleDate: Telegram segura o envio no horário exato
 //
-//   BUG #C — FloodWait no sniper gera ~30.000 chamadas em 30s:
-//     Sniper agora detecta FloodWait e aguarda o tempo exato antes de retomar.
-//     Se o wait excede o budget, encerra o loop graciosamente.
+// Fix v15 (2025-06) — sleep calibrado substitui scheduleDate + fix de posições:
 //
-//   BUG #D — reloadClient() deleta mutex sem await da promise inflight:
-//     Aguarda a promise em andamento antes de deletar connectingPromises,
-//     evitando AUTH_KEY_DUPLICATED por conexão dupla simultânea.
+//   BUG #K — scheduleDate tem granularidade de 1s e entrega em ms aleatório:
+//     Medições com 3 testes mostraram conta 065 chegando consistentemente
+//     em -3ms a -5ms (antes do horário!) e conta 730 chegando em +1ms a +13ms.
+//     O Telegram decide internamente em qual ms do segundo entrega — sem controle
+//     nosso. Para leilões onde 200ms = 30 posições, isso é inaceitável.
 //
-//   BUG #E — prewarmAccounts() a cada 30s chama getDialogs em todas as contas:
-//     Prewarm completo (getDialogs + peer pre-resolve) só roda no boot.
-//     O interval periódico chama reconnectDeadClients() — apenas reconecta
-//     clientes offline sem recarregar dialogs.
+//   SOLUÇÃO — sleep calibrado por conta antes do invoke (sem scheduleDate):
+//     Antes de cada invoke no loop paralelo, cada slot dorme até:
+//       scheduledAt + TARGET_ARRIVAL_OFFSET_MS - ONE_WAY_RTT_ESTIMATE_MS
+//     Com TARGET=10ms e ONE_WAY=23ms, o invoke sai em scheduledAt-13ms
+//     e a mensagem chega ao servidor em ~scheduledAt+10ms.
+//     Todas as contas dormem até o MESMO timestamp absoluto → disparam juntas.
+//     Garante: (1) nunca chega antes do horário, (2) chega ~10ms depois,
+//     (3) todas as contas chegam no mesmo instante.
+//     Calibrar ONE_WAY_RTT_ESTIMATE_MS com os logs [sniper][timing].
 //
-//   BUG #F — makeRandomId com entropia insuficiente (colisão em envios paralelos):
-//     Usa 64 bits reais via shiftLeft(32) na biblioteca big-integer.
+//   BUG #L — posição calculada incluía mensagens pré-leilão:
+//     windowStartUnix começava MONITOR_WINDOW_BEFORE_MS (5s) antes do
+//     scheduledAt, fazendo mensagens enviadas ANTES da abertura do leilão
+//     contarem como posições anteriores às nossas.
 //
-//   BUG #G — keepalive sem jitter: spike de N contas simultâneas a cada 45s:
-//     Cada setInterval recebe até 10s de jitter aleatório no boot.
+//   SOLUÇÃO — auctionStartUnix separado do windowStartUnix:
+//     _savePositions() recebe auctionStartUnix (= Math.floor(scheduledAt/1000)
+//     para closed, = windowStartUnix para open). Posição conta apenas
+//     mensagens com date >= auctionStartUnix E id < myMsgId.
+//     A busca do histórico ainda usa windowStartUnix mais amplo para contexto,
+//     mas a contagem de posição é precisa a partir do segundo de abertura.
 //
-// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS:
+// Fix v16 (2025-06) — fix grupo aberto + remoção do listen-manual:
 //
-//   OPT #6 — SNIPER_BEFORE_MS aumentado de 20 para 45ms:
-//     Railway US East → Telegram DC1/DC3 Miami: RTT medido ~50ms (round-trip).
-//     Invoke one-way ~25ms + event loop lag Node.js ~5-15ms = precisa de ~40ms
-//     de antecipação mínima. 45ms dá ~5ms de margem.
-//     Calibrar com os logs [sniper][timing] após alguns disparos reais.
+//   BUG #M — gotSignal em startGroupListener só aceitava texto "ok":
+//     Emoji (👍, etc.) chegam como m.message com o caractere do emoji —
+//     não são mídia — e não passavam pelo isOk (=== "ok"). Agora aceita
+//     qualquer texto não vazio OU mídia, igual à lógica da v12.
 //
-//   OPT #7 — logs de timing no sniper para diagnóstico preciso:
-//     [sniper][timing] timer lag: Xms   → quanto o setTimeout atrasou
-//     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
-//     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
-//     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
+//   REMOÇÃO — endpoint POST /groups/:id/listen (listen-manual) removido:
+//     O disparo de grupos abertos é 100% automático via startGroupListener.
+//     O endpoint manual era redundante e mantinha lógica duplicada e divergente.
+//     O DELETE /groups/:id/listen (abortar listener) foi mantido.
 //
-// Fix v8 (2025-05) — randomId estável por ciclo de tentativas:
-//   BUG #H — timeout pós-envio com retry gera mensagem duplicada:
-//     Se o invoke chegar ao Telegram mas o ACK for perdido na rede, o retry
-//     com randomId novo é tratado como mensagem nova pelo Telegram.
-//     sendMessage() e sniperSendOnce() agora geram o randomId UMA vez por
-//     ciclo e reutilizam nos retries — Telegram deduplica automaticamente.
+// Fix v17 (2025-06) — 3 fixes críticos:
 //
-// Fix v9 (2025-05) — 3 fixes cirúrgicos sobre o v8 original:
+//   BUG #N — posição calculada errada quando múltiplas contas mandam o mesmo texto:
+//     _savePositions buscava a mensagem só pelo texto (m.message === sm.message_text).
+//     Se conta A e conta B mandam o mesmo texto, ambas achavam a MESMA mensagem no
+//     histórico e registravam a mesma posição.
+//     SOLUÇÃO: _savePositions agora recebe um Map<account_id, message_id> (myMsgIds)
+//     resolvido ANTES de chamar a função. O caller (monitorPositions) cruza o histórico
+//     com o peer_id/from_id de cada mensagem para achar o msg_id certo por conta.
+//     Se não achar pelo from_id (conta anônima/canal), cai de volta no texto como
+//     desempate, mas nunca reutiliza o mesmo msg_id para duas contas diferentes.
 //
-//   FIX #1 — AUTH_KEY_DUPLICATED não é retryable:
-//     isRetryableError() agora inclui AUTH_KEY_DUPLICATED na lista de erros
-//     permanentes. Antes, esse erro entrava em retry loop infinito porque a
-//     função não o reconhecia como fatal.
+//   BUG #O — monitor falha silenciosamente quando conta não está no accountCache:
+//     monitorPositions pegava account = accountCache.get(sentMembers[0].account_id).
+//     Se a conta foi adicionada depois do boot (sem prewarm), não está no cache
+//     e o monitor aborta sem salvar nenhuma posição.
+//     SOLUÇÃO: busca a conta no Supabase como fallback quando não está no cache.
+//     Garante que o monitor sempre tenha um client válido para buscar o histórico.
 //
-//   FIX #2 — Falha na fase 2 do sniper não gera retry do ciclo inteiro:
-//     Se a conta 1 (fase 1) já enviou com sucesso, falhas das contas da fase 2
-//     são tratadas como não-retryable antes de chamar updateScheduleAfterDispatch.
-//     Isso evita que o schedule volte a disparar — re-enviando a conta 1 que já
-//     enviou e causando mensagem duplicada no grupo.
+//   BUG #P — delay entre disparos no mesmo grupo (grupos abertos, múltiplas contas):
+//     dispatchToGroup usava Promise.all mas cada sendMessage tem RETRY_BUDGET_MS=50s
+//     de budget interno. Se a 1ª conta demorava, todas as outras esperavam junto.
+//     Na prática o Promise.all rodava em paralelo mas dentro de sendMessage havia
+//     backoff exponencial (1s→2s→4s→8s) que não tinha timeout externo por slot.
+//     SOLUÇÃO: cada slot em dispatchToGroup tem agora um timeout externo de
+//     DISPATCH_SLOT_TIMEOUT_MS (padrão 12s). Se uma conta não enviou em 12s,
+//     marca como failed sem bloquear as outras. Budget total do grupo mantido
+//     pelo Promise.all. Reduz latência de N*backoff para max(12s) em paralelo.
 //
-//   FIX #3 — Guard de scheduledAt antes do invoke na fase 1:
-//     Antes de cada sniperSendOnce() na fase 1, verifica se já passou o
-//     scheduledAt. Se não passou, dorme o tempo restante. O invoke nunca
-//     acontece antes do horário agendado.
-//     Métrica de sucesso: [sniper][timing] vs horário sempre >= 0ms.
+// Fix v20 (2025-06) — monitor: filtro de mensagens errado (BUG #R):
 //
-// Fix v10 (2025-05) — H3: fase 2 paralela:
-//   BUG #H3 — fase 2 serial: contas 2..N chegavam escalonadas (~50ms cada):
-//     A fase 2 do sniperFireClosed() agora dispara todas as contas em
-//     Promise.allSettled() simultâneo. Cada conta corre de forma independente:
-//     getClient + sniperSendOnce + insert no dispatch_log.
-//     Resultado: conta 2, 3, …N chegam ao Telegram quase no mesmo instante
-//     que a conta 1, em vez de escalonadas em intervalos de ~50ms.
+//   BUG #R — GetHistory retorna objetos com className="Message", não m._="message":
+//     O filtro `m._ === "message"` rejeitava 100% das mensagens retornadas pelo
+//     GramJS, que usa `className` (string Pascal-case) como identificador de tipo,
+//     não o campo `_` da serialização TL raw. Resultado: "Nenhuma mensagem na janela"
+//     mesmo quando o leilão tinha dezenas de mensagens visíveis.
 //
-// Fix v11 (2025-05) — loop unificado: todas as contas em paralelo desde o início:
-//   BUG #H4 — conta 2 ainda aguardava ACK da conta 1 antes de disparar:
-//     Medição real: conta 1 chegou em +57ms, conta 2 em +102ms (delta=45ms).
-//     O delta era exatamente o RTT da conta 1 — conta 2 só disparava após
-//     firstSentAt ser definido (fim da fase 1).
+//   SOLUÇÃO — aceita className OR m._ OR presença de m.message:
+//     Filtro robusto: `m.className === "Message" || m._ === "message" || m.message != null`.
+//     Cobre GramJS moderno (className), payload raw TL (m._), e fallback pragmático
+//     (qualquer objeto com campo message é uma mensagem de texto).
+//     windowStartUnix expandido em -30s para absorver skew de clock VPS/Telegram.
+//     Log de debug adicionado: mostra total de msgs, na janela, windowStartUnix e
+//     date da primeira msg — facilita calibração futura sem precisar de logs extras.
 //
-//   SOLUÇÃO — sniperFireClosed() reescrito com loop único unificado:
-//     - Todas as N contas disparam sniperSendOnce em paralelo a cada iteração
-//     - Cada conta tem estado próprio: pending | sent | fatal
-//     - Conta que confirma sent ou erro fatal sai do loop imediatamente
-//     - Contas ainda pending continuam tentando na próxima iteração (1ms)
-//     - Loop encerra quando todas pararam (sent/fatal) ou budget esgotou
-//     - Guard de scheduledAt mantido: nenhuma conta invoca antes do horário
-//     - FloodWait por conta: a conta afetada pausa individualmente
-//     - updateScheduleAfterDispatch roda uma única vez no final
-//     - Resultado esperado: todas as contas chegam ao DC Telegram no mesmo ms
+// Fix v19 (2025-06) — sleep calibrado movido para fora do Promise.allSettled:
 //
-// Fix v12 (2025-06) — monitorPositions: posição real no histórico do grupo:
-//   BUG #I — posição calculada apenas entre as contas cadastradas:
-//     A lógica anterior usava o índice dentro de windowMsgs filtrados pelos
-//     textos das nossas contas (ourTexts). Isso dava posição 1, 2, 3... entre
-//     as nossas mensagens, ignorando todas as outras pessoas do grupo.
+//   BUG #Q — contention entre snipers simultâneos (dois schedules no mesmo horário):
+//     O sleep calibrado estava DENTRO do Promise.allSettled, em cada slot.
+//     Quando dois sniperFireClosed rodam em paralelo no mesmo processo Node.js,
+//     o await do sleep interno cede o event loop para o outro sniper.
+//     Resultado: o segundo sniper disparava 20~30ms depois do primeiro, mesmo
+//     que ambos tivessem contas completamente independentes.
 //
-//   SOLUÇÃO — posição pelo message_id global do chat:
-//     message_id no Telegram é sequencial e global por chat. Para cada conta,
-//     buscamos sua mensagem no histórico pelo texto, pegamos o message_id, e
-//     contamos quantas mensagens na janela têm message_id menor — esse count+1
-//     é a posição real, levando em conta todos os participantes do grupo.
+//   SOLUÇÃO — sleep único ANTES do Promise.allSettled (globalAttempt === 1 apenas):
+//     O sleep é feito uma única vez, antes de entrar no allSettled.
+//     Dentro do allSettled, os slots invocam diretamente sem nenhum await de timing.
+//     Isso garante que todos os invokes saem no mesmo tick do event loop,
+//     e que dois snipers concorrentes não se atrasam mutuamente.
 //
-//   MUDANÇAS:
-//     - _savePositions(): nova helper que recebe windowMsgs ordenado por
-//       message_id crescente e calcula posição de cada conta pelo critério acima.
-//     - monitorPositions() grupo fechado: aguarda POST_DISPATCH_WAIT_MS=10s
-//       fixos, busca 200 mensagens uma única vez, calcula e salva posições.
-//     - monitorPositions() grupo aberto: mantém polling original, mas agora
-//       delega o cálculo de posição para _savePositions().
-//     - Zero impacto no caminho crítico: monitorPositions ainda é chamado
-//       em background via .catch() em todos os pontos de disparo.
+// Fix v18 (2025-06) — resolução real de msg_id por from_id + simplifica monitor:
 //
-// Fix v13 (2026-06) — sinal de grupo aberto só pode vir da conta monitorada:
-//   BUG #J — startGroupListener() e o listener manual disparavam com a
-//     mensagem de QUALQUER pessoa no grupo, não só da admin/conta monitorada
-//     (trigger_account_id). Isso causava disparo prematuro por mensagem de
-//     terceiros no grupo aberto.
+//   BUG #N (fix definitivo) — resolveMsgIds da v17 era um stub: o bloco de
+//     resolução via from_id estava vazio e caía direto no fallback por texto,
+//     que não garante a posição correta quando duas contas mandam o mesmo texto
+//     (apenas evita reusar o mesmo msg_id, mas pode atribuir o msg_id errado
+//     entre as contas).
+//     SOLUÇÃO: telegramUserIdCache (account.id UUID → telegram numeric user id),
+//     populado via client.getMe() em getClient() na primeira conexão de cada
+//     conta. resolveMsgIds agora casa m.fromId?.userId / m.peerId?.userId do
+//     histórico com esse id numérico — identificação correta por conta mesmo
+//     com textos idênticos. Fallback por texto mantido apenas para contas
+//     anônimas/canais onde from_id não vem preenchido.
 //
-//   SOLUÇÃO — isFromMonitoredAccount() filtra recentMsgs pelo fromId.userId
-//     (ou channelId/chatId) comparado a group.trigger_account_id antes de
-//     considerar texto/mídia como sinal. trigger_account_id agora é
-//     selecionado em SCHEDULE_SELECT e no select do listener manual.
-//     Grupos legados sem trigger_account_id mantêm o comportamento antigo
-//     (qualquer mensagem) para não quebrar configurações existentes.
+//   BUG #O (ajuste) — monitorPositions buscava monitorAccount de novo via
+//     accountCache.get isoladamente após getMonitorClient, podendo divergir
+//     da conta que de fato forneceu o client. getMonitorClient agora retorna
+//     { client, account } juntos — fonte única, sem busca redundante.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -192,9 +201,25 @@ const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
 const MONITOR_POLL_MS               = 5_000;
-const LISTEN_POLL_MS                = 3_000;
+const LISTEN_POLL_MS                = 1000;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
+
+// v17 BUG #P: timeout externo por slot em dispatchToGroup para grupos abertos.
+// Evita que uma conta lenta segure todas as outras no Promise.all.
+// Deve ser <= SEND_TIMEOUT_MS (15s) para não mascarar falhas reais.
+const DISPATCH_SLOT_TIMEOUT_MS      = 12_000;
+
+// v15: sleep calibrado — invoke sai em scheduledAt - (ONE_WAY - TARGET)
+// Mensagem chega ao servidor em scheduledAt + TARGET_ARRIVAL_OFFSET_MS.
+// Calibrar ONE_WAY_RTT_ESTIMATE_MS com os logs [sniper][timing] após disparos reais.
+// Formula: ONE_WAY ≈ (invoke_RTT_round_trip / 2)
+const TARGET_ARRIVAL_OFFSET_MS      = 10;   // chega 10ms depois do horário agendado
+const ONE_WAY_RTT_ESTIMATE_MS       = 23;   // RTT one-way medido VPS→Telegram DC
+
+// SNIPER_BEFORE_MS: quanto antes do scheduledAt o setTimeout dispara.
+// Deve ser > (ONE_WAY_RTT_ESTIMATE_MS - TARGET_ARRIVAL_OFFSET_MS) + margem.
+// Com ONE_WAY=23 e TARGET=10: precisa de >13ms. 45ms dá margem confortável.
 const SNIPER_BEFORE_MS              = 45;
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
@@ -203,11 +228,10 @@ const SNIPER_PAUSE_MS               = 5;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
-// Monitor v12: aguarda N segundos após disparo para capturar histórico completo do leilão
+// Monitor v12/v15: aguarda N segundos após disparo para capturar histórico completo
 const MONITOR_POST_DISPATCH_WAIT_MS = 10_000;
-// Quantas mensagens buscar no histórico para calcular posição
 const MONITOR_HISTORY_FETCH_LIMIT   = 200;
-// Janela de tempo antes do disparo para delimitar início da janela de busca
+// Janela de tempo antes do disparo para buscar contexto (fetch mais amplo)
 const MONITOR_WINDOW_BEFORE_MS      = 5_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
@@ -240,7 +264,6 @@ interface Group {
   telegram_chat_id: string | null;
   telegram_chat_name: string | null;
   group_type: "open" | "closed";
-  trigger_account_id: number | null;
   group_members: GroupMember[];
 }
 
@@ -276,6 +299,9 @@ const sessions              = new Map<string, string>();
 const keepaliveTimers       = new Map<string, ReturnType<typeof setInterval>>();
 const peerCache             = new Map<string, unknown>();
 const accountCache          = new Map<string, Account>();
+// v18: account.id (UUID) -> telegram numeric user id, resolvido via client.getMe()
+// na primeira conexão. Necessário para casar mensagens no histórico por from_id.
+const telegramUserIdCache   = new Map<string, string>();
 const scheduledTimers       = new Map<string, ReturnType<typeof setTimeout>>();
 const prefetchTimers        = new Map<string, ReturnType<typeof setTimeout>>();
 const sniperTimers          = new Map<string, ReturnType<typeof setTimeout>>();
@@ -293,7 +319,7 @@ const SCHEDULE_SELECT = `
   retry_window_seconds, retry_interval_seconds, retry_interval_max_seconds,
   retry_count, retry_until, last_attempt_at,
   groups(
-    id, name, telegram_chat_id, telegram_chat_name, group_type, trigger_account_id,
+    id, name, telegram_chat_id, telegram_chat_name, group_type,
     group_members(
       id, message_text, position, is_active,
       accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)
@@ -311,16 +337,6 @@ function isRetryableError(msg: string): boolean {
          !u.includes("AUTH_KEY_DUPLICATED") &&
          !u.includes("USER_DEACTIVATED") &&
          !u.includes("SESSION_REVOKED");
-}
-
-// Fix v13 (revisado) — sinal de grupo aberto: qualquer pessoa pode mandar,
-// mas só passa se texto tiver <= 5 chars (ok, emoji, etc.) ou for mídia.
-// Texto longo de qualquer um = ignora. Sem filtro de conta.
-function isSignalMessage(m: any): boolean {
-  const text = typeof m.message === "string" ? m.message.trim() : "";
-  const hasShortText = text.length > 0 && text.length <= 5;
-  const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-  return hasShortText || isMedia;
 }
 
 function nextWeeklyOccurrence(cron: string): string {
@@ -427,6 +443,20 @@ async function getClient(account: Account): Promise<TelegramClient> {
 
     clients.set(account.id, client);
     sessions.set(account.id, account.session_string);
+
+    // v18: resolve e cacheia o telegram user id numérico desta conta.
+    // Usado por resolveMsgIds para casar mensagens no histórico via from_id.
+    if (!telegramUserIdCache.has(account.id)) {
+      try {
+        const me = await client.getMe();
+        const meId = (me as any)?.id;
+        if (meId != null) {
+          telegramUserIdCache.set(account.id, String(meId));
+        }
+      } catch (err: any) {
+        console.warn(`[client] Não foi possível resolver telegram user id de ${account.phone_number}: ${err.message}`);
+      }
+    }
 
     const jitter   = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
     const interval = setInterval(async () => {
@@ -651,17 +681,16 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO
+   SNIPER — ENVIO ÚNICO COM PEER JÁ RESOLVIDO
+   v15: sem scheduleDate — o timing é controlado pelo sleep calibrado no loop.
+   peer é passado diretamente — resolvePeer NÃO é chamado aqui.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperSendOnce(
   client: TelegramClient,
-  account: Account,
-  telegramChatId: string,
+  peer: unknown,
   messageText: string,
-  randomId: bigInt.BigInteger
+  randomId: bigInt.BigInteger,
 ): Promise<void> {
-  const peer = await resolvePeer(client, telegramChatId, account.id);
-
   await Promise.race([
     client.invoke(new Api.messages.SendMessage({
       peer:      peer as any,
@@ -676,7 +705,12 @@ async function sniperSendOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER LOOP — GRUPOS FECHADOS (v11: loop unificado, todas as contas em paralelo)
+   SNIPER LOOP — GRUPOS FECHADOS
+   v15: sleep calibrado substitui scheduleDate.
+   Antes de cada invoke, cada slot dorme até:
+     scheduledAt + TARGET_ARRIVAL_OFFSET_MS - ONE_WAY_RTT_ESTIMATE_MS
+   Todas as contas dormem até o MESMO timestamp absoluto → disparam juntas.
+   Resultado esperado: mensagem chega em scheduledAt + ~10ms, nunca antes.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -711,7 +745,15 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const scheduledAt     = new Date(schedule.next_run_at).getTime();
     const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
     const timerLagMs      = sniperEnteredAt - plannedSniperAt;
+
+    // v15: target de disparo — invoke sai aqui, chega em scheduledAt+TARGET
+    const invokeFireAt    = scheduledAt + TARGET_ARRIVAL_OFFSET_MS - ONE_WAY_RTT_ESTIMATE_MS;
+
     console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
+    console.log(
+      `[sniper][timing] target fire: scheduledAt${invokeFireAt - scheduledAt >= 0 ? "+" : ""}${invokeFireAt - scheduledAt}ms ` +
+      `→ chegada esperada: scheduledAt+${TARGET_ARRIVAL_OFFSET_MS}ms`
+    );
 
     const group = schedule.groups;
 
@@ -745,39 +787,44 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     type AccountState = "pending" | "sent" | "fatal";
 
     interface SlotState {
-      member:       typeof members[number];
-      account:      Account;
-      state:        AccountState;
-      randomId:     bigInt.BigInteger;
-      client:       TelegramClient | null;
-      sentAt:       Date | null;
-      error:        string | undefined;
-      attempts:     number;
-      floodUntil:   number;           // timestamp até onde esta conta está em FloodWait
+      member:     typeof members[number];
+      account:    Account;
+      state:      AccountState;
+      randomId:   bigInt.BigInteger;
+      client:     TelegramClient | null;
+      peer:       unknown;
+      sentAt:     Date | null;
+      error:      string | undefined;
+      attempts:   number;
+      floodUntil: number;
     }
 
-    // Pré-conecta todos os clientes antes do loop agressivo
+    // Pré-conecta todos os clientes E resolve todos os peers antes do loop.
     const slots: SlotState[] = await Promise.all(
       members.map(async (member) => {
         const account = member.accounts!;
         let client: TelegramClient | null = null;
+        let peer: unknown = null;
         let state: AccountState = "pending";
         let error: string | undefined;
 
         try {
           client = await getClient(account);
+          peer = await resolvePeer(client, chatId, account.id);
+          console.log(`[sniper] ✓ Peer pré-resolvido: ${account.phone_number}`);
         } catch (err: any) {
           error = String(err?.message ?? "");
           state = "fatal";
-          console.error(`[sniper] Falha ao conectar ${account.phone_number}: ${error}`);
+          console.error(`[sniper] Falha ao preparar ${account.phone_number}: ${error}`);
         }
 
         return {
           member,
           account,
           state,
-          randomId:   makeRandomId(),   // randomId estável por conta, reutilizado nos retries
+          randomId:   makeRandomId(),
           client,
+          peer,
           sentAt:     null,
           error,
           attempts:   0,
@@ -795,39 +842,60 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       globalAttempt++;
 
-      // Guard de scheduledAt: nenhuma conta invoca antes do horário agendado.
-      // Só precisa verificar uma vez por iteração — todas as contas compartilham o mesmo alvo.
-      const msUntilScheduled = scheduledAt - Date.now();
-      if (msUntilScheduled > 0) {
-        if (globalAttempt === 1) {
-          console.log(`[sniper] ⏳ Aguardando scheduledAt (faltam ${msUntilScheduled}ms)`);
-        }
-        await new Promise(r => setTimeout(r, msUntilScheduled));
-        if (Date.now() >= budgetEnd) break;
-      }
-
       const now2 = Date.now();
 
-      // Dispara todas as contas pending em paralelo (exceto as em FloodWait)
+      // v19: sleep calibrado movido para FORA do Promise.allSettled.
+      // Quando dois snipers rodam em paralelo no mesmo processo, o sleep interno
+      // cederia o event loop para o outro sniper, causando atraso no segundo disparo.
+      // Ao dormir aqui (antes do allSettled), todos os invokes saem no mesmo tick.
+      // Apenas na primeira iteração (globalAttempt === 1) o sleep faz sentido;
+      // nas retentativas (flood/timeout), disparamos imediatamente.
+      if (globalAttempt === 1) {
+        const preSleepMs = invokeFireAt - Date.now();
+        if (preSleepMs > 0) {
+          await new Promise(r => setTimeout(r, preSleepMs));
+        }
+      }
+
       await Promise.allSettled(
         pendingSlots.map(async (slot) => {
-          // Pula contas ainda em cooldown de FloodWait
           if (slot.floodUntil > now2) return;
 
+          if (!slot.peer) {
+            try {
+              slot.peer = await resolvePeer(slot.client!, chatId, slot.account.id);
+            } catch (err: any) {
+              slot.state = "fatal";
+              slot.error = String(err?.message ?? "");
+              console.error(`[sniper] Falha ao re-resolver peer ${slot.account.phone_number}: ${slot.error}`);
+              return;
+            }
+          }
+
+          // Sem sleep aqui — o sleep foi feito antes do allSettled (v19).
+          // Todos os slots entram no invoke ao mesmo tempo, no mesmo tick do event loop.
+
           slot.attempts++;
+          const invokeStartMs = Date.now();
 
           try {
-            await sniperSendOnce(slot.client!, slot.account, chatId, slot.member.message_text ?? "", slot.randomId);
+            await sniperSendOnce(
+              slot.client!,
+              slot.peer,
+              slot.member.message_text ?? "",
+              slot.randomId,
+            );
 
             slot.sentAt = new Date();
             slot.state  = "sent";
 
-            const invokeRttMs = slot.sentAt.getTime() - sniperEnteredAt;
+            const ackRttMs    = slot.sentAt.getTime() - invokeStartMs;
             const vsHorarioMs = slot.sentAt.getTime() - scheduledAt;
             console.log(
               `[sniper][timing] ${slot.account.phone_number} — ` +
-              `invoke RTT: ${invokeRttMs}ms | ` +
-              `vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms | ` +
+              `ACK RTT: ${ackRttMs}ms | ` +
+              `vs horário ACK: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms | ` +
+              `chegada estimada: +${TARGET_ARRIVAL_OFFSET_MS}ms | ` +
               `tentativa: ${slot.attempts}`
             );
             console.log(`[sniper] ✓ ${slot.account.phone_number} enviou`);
@@ -835,7 +903,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
-            // Erro fatal — para de tentar esta conta
             const isFatal =
               errMsg.includes("AUTH_KEY_UNREGISTERED") ||
               errMsg.includes("AUTH_KEY_DUPLICATED")   ||
@@ -849,7 +916,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
               return;
             }
 
-            // FloodWait — agenda cooldown individual para esta conta
             const isFlood =
               err?.seconds != null ||
               err?.constructor?.name === "FloodWaitError" ||
@@ -872,22 +938,18 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
               return;
             }
 
-            // Peer inválido — limpa cache
             if (
               errMsg.includes("PEER_ID_INVALID") ||
               errMsg.includes("CHANNEL_INVALID") ||
               errMsg.includes("CHANNEL_PRIVATE")
             ) {
               peerCache.delete(`${slot.account.id}:${chatId}`);
+              slot.peer = null;
             }
-
-            // Erro transitório — continua tentando na próxima iteração
-            // (sem log verboso para não poluir durante grupo fechado)
           }
         })
       );
 
-      // Pausa mínima entre iterações (idêntico ao comportamento anterior)
       if (slots.some(s => s.state === "pending")) {
         if (globalAttempt % SNIPER_PAUSE_EVERY_N === 0) {
           await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
@@ -908,7 +970,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         };
       }
 
-      const timedOut = slot.state === "pending"; // ainda pending = budget esgotou
+      const timedOut = slot.state === "pending";
       const errMsg   = timedOut
         ? `SNIPER_BUDGET_EXCEEDED após ${slot.attempts} tentativas`
         : (slot.error ?? "FATAL_ERROR");
@@ -917,9 +979,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         console.warn(`[sniper] Budget esgotado para ${slot.account.phone_number} após ${slot.attempts} tentativas`);
       }
 
-      // Determina retryable:
-      // - Se pelo menos 1 conta enviou, as demais são não-retryable (evita re-disparo do ciclo)
-      // - Se nenhuma enviou, respeita isRetryableError
       const anySent   = slots.some(s => s.state === "sent");
       const retryable = anySent ? false : (!timedOut ? isRetryableError(errMsg) : true);
 
@@ -932,8 +991,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       };
     });
 
-    // ── Log de dispatch para todas as contas ─────────────────────────────
-    // Dispara em background — não bloqueia o caminho crítico
+    // ── Log de dispatch ───────────────────────────────────────────────────
     for (const [i, slot] of slots.entries()) {
       const result = results[i];
       supabase.from("dispatch_logs").insert({
@@ -954,26 +1012,23 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     }
 
     // ── Monitoramento de posições ─────────────────────────────────────────
-    const sentSlots = slots.filter(s => s.state === "sent");
-    const firstSentAt = sentSlots.length > 0
-      ? sentSlots.reduce((min, s) => s.sentAt! < min ? s.sentAt! : min, sentSlots[0].sentAt!)
-      : null;
+    const sentSlots   = slots.filter(s => s.state === "sent");
+    const dispatchRef = sentSlots.length > 0 ? new Date(scheduledAt) : now;
 
-    if (sentSlots.length > 0 && firstSentAt) {
+    if (sentSlots.length > 0) {
       const sentForMonitor = sentSlots.map(s => ({
         account_id:   s.account.id,
         message_text: s.member.message_text ?? "",
       })).filter(s => s.message_text);
 
       if (sentForMonitor.length > 0) {
-        monitorPositions(chatId, sentForMonitor, scheduleId, firstSentAt, "closed")
+        monitorPositions(chatId, sentForMonitor, scheduleId, dispatchRef, "closed")
           .catch(err => console.error("[sniper][monitor] Erro:", err.message));
       }
     }
 
-    // ── Atualiza schedule no banco ────────────────────────────────────────
-    const dispatchNow = firstSentAt ?? now;
-    await updateScheduleAfterDispatch(schedule, results, dispatchNow, "closed");
+    // ── Atualiza schedule ─────────────────────────────────────────────────
+    await updateScheduleAfterDispatch(schedule, results, dispatchRef, "closed");
 
   } finally {
     sniperFiringNow.delete(scheduleId);
@@ -1008,38 +1063,44 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   MONITOR — HELPER INTERNO: calcula e persiste posições reais
-   windowMsgs deve estar ordenado por message_id crescente (ordem de chegada).
-   Posição = quantas mensagens na janela têm message_id < o meu + 1.
-   Isso conta TODOS os participantes do grupo, não só as nossas contas.
+   MONITOR — HELPER INTERNO
+   v17: recebe myMsgIds Map<account_id, msg_id> para identificar a mensagem
+   exata de cada conta no histórico, sem depender só do texto.
+   Isso corrige o BUG #N onde duas contas com o mesmo texto pegavam o mesmo msg_id.
    ───────────────────────────────────────────────────────────────────────────── */
 async function _savePositions(
   sentMembers: Array<{ account_id: string; message_text: string }>,
-  windowMsgs: any[],  // já ordenado por m.id crescente
+  windowMsgs: any[],
+  auctionStartUnix: number,
   scheduleId: string,
   dispatchedAt: Date,
+  myMsgIds: Map<string, number>,  // v17: account_id → msg_id resolvido pelo caller
 ): Promise<void> {
   const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
 
   await Promise.allSettled(sentMembers.map(sm => {
     if (!sm.message_text) return;
 
-    // Localiza esta mensagem no histórico pelo texto
-    const myMsgIndex = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
-    if (myMsgIndex < 0) {
-      console.warn(`[monitor] Mensagem não encontrada no histórico para conta ${sm.account_id}`);
+    // v17: usa o msg_id pré-resolvido por conta (sem ambiguidade de texto duplicado)
+    const myMsgId = myMsgIds.get(sm.account_id);
+
+    if (myMsgId == null) {
+      console.warn(
+        `[monitor] msg_id não resolvido para conta ${sm.account_id} ` +
+        `(auctionStartUnix=${auctionStartUnix})`
+      );
       return;
     }
 
-    const myMsgId = windowMsgs[myMsgIndex].id as number;
-
-    // Posição real: quantas mensagens chegaram antes da nossa (message_id menor) + 1
-    // message_id é sequencial e global por chat no Telegram — não depende de timestamp
-    const position = windowMsgs.filter((m: any) => (m.id as number) < myMsgId).length + 1;
+    const position = windowMsgs.filter(
+      (m: any) => (m.id as number) < myMsgId && (m.date as number) >= auctionStartUnix
+    ).length + 1;
 
     console.log(
       `[monitor] ${sm.account_id}: posição #${position} ` +
-      `(msg_id=${myMsgId}, total na janela=${windowMsgs.length})`
+      `(msg_id=${myMsgId}, msgs na janela do leilão=${
+        windowMsgs.filter((m: any) => (m.date as number) >= auctionStartUnix).length
+      })`
     );
 
     return supabase.from("dispatch_logs")
@@ -1054,12 +1115,121 @@ async function _savePositions(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   MONITORAMENTO DE POSIÇÃO (v12)
-   — Grupo fechado: aguarda MONITOR_POST_DISPATCH_WAIT_MS após o disparo,
-     busca MONITOR_HISTORY_FETCH_LIMIT mensagens do histórico uma única vez,
-     ordena por message_id crescente e delega para _savePositions().
-   — Grupo aberto: mantém polling original; delega cálculo para _savePositions().
-   — Zero impacto no caminho crítico: sempre chamado em background via .catch().
+   RESOLVE MSG_IDS POR CONTA NO HISTÓRICO
+   v17: cruza o histórico com from_id para identificar a mensagem exata de cada
+   conta. Fallback: texto (sem reutilizar o mesmo msg_id para contas diferentes).
+   ───────────────────────────────────────────────────────────────────────────── */
+function extractFromUserId(m: any): string | null {
+  // GramJS: m.fromId pode ser PeerUser { userId }, PeerChannel, PeerChat, ou ausente
+  // (mensagens anônimas de admin usam peerId do canal/grupo em vez de fromId).
+  const fromId = m.fromId ?? m.from_id;
+  if (fromId?.userId != null) return String(fromId.userId);
+  if (fromId?.user_id != null) return String(fromId.user_id);
+
+  // Fallback: out === true + peerId do tipo user (DMs ou casos atípicos)
+  const peerId = m.peerId ?? m.peer_id;
+  if (m.out && (peerId?.userId != null || peerId?.user_id != null)) {
+    return String(peerId.userId ?? peerId.user_id);
+  }
+
+  return null;
+}
+
+function resolveMsgIds(
+  sentMembers: Array<{ account_id: string; message_text: string }>,
+  windowMsgs: any[],
+  auctionStartUnix: number,
+): Map<string, number> {
+  const result = new Map<string, number>();
+  const usedMsgIds = new Set<number>();
+
+  // 1. Resolução primária: casa por telegram_user_id (from_id) da mensagem.
+  //    Mais precisa — funciona mesmo com textos idênticos entre contas.
+  for (const sm of sentMembers) {
+    const telegramUserId = telegramUserIdCache.get(sm.account_id);
+    if (!telegramUserId) continue;
+
+    const match = windowMsgs.find(
+      (m: any) =>
+        (m.date as number) >= auctionStartUnix &&
+        !usedMsgIds.has(m.id as number) &&
+        extractFromUserId(m) === telegramUserId
+    );
+
+    if (match) {
+      result.set(sm.account_id, match.id as number);
+      usedMsgIds.add(match.id as number);
+      console.log(`[monitor] ${sm.account_id}: msg_id=${match.id} resolvido via from_id (telegram_user_id=${telegramUserId})`);
+    }
+  }
+
+  // 2. Fallback: por texto, para contas sem telegram_user_id cacheado ou cuja
+  //    mensagem não trouxe from_id (admin anônimo/canal). Nunca reusa um msg_id
+  //    já atribuído na etapa 1 ou nesta etapa.
+  for (const sm of sentMembers) {
+    if (result.has(sm.account_id)) continue;
+
+    const match = windowMsgs.find(
+      (m: any) =>
+        m.message === sm.message_text &&
+        (m.date as number) >= auctionStartUnix &&
+        !usedMsgIds.has(m.id as number)
+    );
+
+    if (match) {
+      result.set(sm.account_id, match.id as number);
+      usedMsgIds.add(match.id as number);
+      console.warn(`[monitor] ${sm.account_id}: msg_id=${match.id} resolvido via fallback de texto (from_id indisponível)`);
+    }
+  }
+
+  return result;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   BUSCA CLIENT VÁLIDO PARA MONITOR
+   v17 BUG #O: busca conta no Supabase como fallback quando não está no cache.
+   Garante que o monitor sempre tenha um client para buscar histórico,
+   mesmo para contas adicionadas depois do boot (sem prewarm).
+   ───────────────────────────────────────────────────────────────────────────── */
+async function getMonitorClient(
+  sentMembers: Array<{ account_id: string; message_text: string }>
+): Promise<{ client: TelegramClient; account: Account } | null> {
+  // v18: retorna { client, account } juntos — elimina busca redundante depois.
+  // Tenta cada conta da lista até conseguir um client válido
+  for (const sm of sentMembers) {
+    // 1. Tenta do cache em memória
+    let account = accountCache.get(sm.account_id);
+
+    // 2. Fallback: busca no Supabase (BUG #O fix)
+    if (!account) {
+      try {
+        const { data } = await supabase
+          .from("accounts")
+          .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+          .eq("id", sm.account_id)
+          .eq("is_active", true)
+          .single();
+        if (data) {
+          account = data as Account;
+          accountCache.set(account.id, account); // popula cache para próximos usos
+        }
+      } catch {}
+    }
+
+    if (!account) continue;
+
+    try {
+      const client = await getClient(account);
+      if (client.connected) return { client, account };
+    } catch {}
+  }
+
+  return null;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   MONITORAMENTO DE POSIÇÃO (v12/v15/v17)
    ───────────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
@@ -1070,24 +1240,19 @@ async function monitorPositions(
 ): Promise<void> {
   if (sentMembers.length === 0) return;
 
-  const account = accountCache.get(sentMembers[0].account_id);
-  if (!account) {
-    console.warn("[monitor] Conta não encontrada no cache — ignorando");
+  // v17 BUG #O: usa getMonitorClient em vez de só accountCache.get
+  // v18: getMonitorClient retorna { client, account } juntos — sem busca redundante
+  const monitorResult = await getMonitorClient(sentMembers);
+  if (!monitorResult) {
+    console.warn("[monitor] Nenhum client disponível — ignorando monitoramento");
     return;
   }
+  const { client, account: monitorAccount } = monitorResult;
 
-  const client = await getClient(account).catch(() => null);
-  if (!client) {
-    console.warn("[monitor] Sem client — ignorando monitoramento");
-    return;
-  }
-
-  // Limite inferior da janela de busca: MONITOR_WINDOW_BEFORE_MS antes do disparo
   const windowStartUnix = Math.floor(
     (dispatchedAt.getTime() - MONITOR_WINDOW_BEFORE_MS) / 1000
   );
 
-  // ── Grupo fechado: busca única após wait fixo ─────────────────────────
   if (groupType === "closed") {
     console.log(
       `[monitor] ⏳ Aguardando ${MONITOR_POST_DISPATCH_WAIT_MS / 1000}s ` +
@@ -1096,7 +1261,7 @@ async function monitorPositions(
     await new Promise(r => setTimeout(r, MONITOR_POST_DISPATCH_WAIT_MS));
 
     try {
-      const peer   = await resolvePeer(client, telegramChatId, account.id);
+      const peer   = await resolvePeer(client, telegramChatId, monitorAccount.id);
       const result = await client.invoke(
         new Api.messages.GetHistory({
           peer:       peer as any,
@@ -1106,11 +1271,25 @@ async function monitorPositions(
         })
       ) as any;
 
-      // Filtra mensagens na janela e ordena por message_id crescente
-      // (message_id sequencial = ordem exata de chegada no Telegram)
+      // v20: GramJS retorna className ("Message"), não m._ ("message").
+      // O filtro anterior rejeitava 100% das mensagens causando "Nenhuma mensagem na janela".
+      // Aceita tanto className quanto m._ para compatibilidade com diferentes versões do GramJS.
+      // windowStartUnix expandido para 30s antes para absorver skew de clock VPS/Telegram.
       const windowMsgs: any[] = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && (m.date as number) >= windowStartUnix)
+        .filter((m: any) => {
+          const isMsg = m.className === "Message" || m._ === "message" || m.message != null;
+          const inWindow = (m.date as number) >= windowStartUnix - 30;
+          return isMsg && inWindow;
+        })
         .sort((a: any, b: any) => (a.id as number) - (b.id as number));
+
+      console.log(
+        `[monitor][debug] Total msgs no GetHistory: ${result.messages?.length ?? 0}, ` +
+        `na janela: ${windowMsgs.length}, ` +
+        `windowStartUnix=${windowStartUnix}, ` +
+        `primeira msg date=${result.messages?.[0]?.date ?? "N/A"} ` +
+        `(schedule ${scheduleId})`
+      );
 
       if (windowMsgs.length === 0) {
         console.warn(`[monitor] Nenhuma mensagem na janela (closed) — schedule ${scheduleId}`);
@@ -1120,7 +1299,12 @@ async function monitorPositions(
       console.log(
         `[monitor] ${windowMsgs.length} msg(s) na janela para schedule ${scheduleId} (closed)`
       );
-      await _savePositions(sentMembers, windowMsgs, scheduleId, dispatchedAt);
+
+      const auctionStartUnix = Math.floor(dispatchedAt.getTime() / 1000);
+
+      // v17 BUG #N: resolve msg_id por conta antes de salvar posições
+      const myMsgIds = resolveMsgIds(sentMembers, windowMsgs, auctionStartUnix);
+      await _savePositions(sentMembers, windowMsgs, auctionStartUnix, scheduleId, dispatchedAt, myMsgIds);
 
     } catch (err: any) {
       console.warn(`[monitor] Erro ao buscar histórico (closed): ${err.message}`);
@@ -1128,15 +1312,16 @@ async function monitorPositions(
     return;
   }
 
-  // ── Grupo aberto: polling até encontrar nossas mensagens ──────────────
+  // ── Grupo aberto: polling ─────────────────────────────────────────────
   const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
   const deadline = Date.now() + MONITOR_MAX_OPEN_MS;
+  const auctionStartUnix = windowStartUnix;
 
   console.log(`[monitor] Iniciando polling para schedule ${scheduleId} (open)`);
 
   while (Date.now() < deadline) {
     try {
-      const peer   = await resolvePeer(client, telegramChatId, account.id);
+      const peer   = await resolvePeer(client, telegramChatId, monitorAccount.id);
       const result = await client.invoke(
         new Api.messages.GetHistory({
           peer:       peer as any,
@@ -1146,9 +1331,13 @@ async function monitorPositions(
         })
       ) as any;
 
-      // Filtra janela e ordena por message_id crescente
+      // v20: mesmo fix do closed — aceita className ou m._ ou presença de m.message
       const windowMsgs: any[] = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && (m.date as number) >= windowStartUnix)
+        .filter((m: any) => {
+          const isMsg = m.className === "Message" || m._ === "message" || m.message != null;
+          const inWindow = (m.date as number) >= windowStartUnix - 30;
+          return isMsg && inWindow;
+        })
         .sort((a: any, b: any) => (a.id as number) - (b.id as number));
 
       if (windowMsgs.length === 0 || !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
@@ -1156,7 +1345,9 @@ async function monitorPositions(
         continue;
       }
 
-      await _savePositions(sentMembers, windowMsgs, scheduleId, dispatchedAt);
+      // v17 BUG #N: resolve msg_id por conta antes de salvar posições
+      const myMsgIds = resolveMsgIds(sentMembers, windowMsgs, auctionStartUnix);
+      await _savePositions(sentMembers, windowMsgs, auctionStartUnix, scheduleId, dispatchedAt, myMsgIds);
       return;
 
     } catch (err: any) {
@@ -1170,6 +1361,7 @@ async function monitorPositions(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    LISTENER DE GRUPO ABERTO
+   v16: gotSignal aceita qualquer texto não vazio OU mídia (emoji, figurinha, etc.)
    ───────────────────────────────────────────────────────────────────────────── */
 function startGroupListener(schedule: Schedule, group: Group, account: Account): void {
   const existing = listenMap.get(group.id);
@@ -1198,50 +1390,19 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         try {
           if (!client.connected) {
-            console.warn(`[listen] Client desconectado — aguardando autoReconnect (${schedule.id})`);
-            // dá tempo pro autoReconnect nativo do GramJS (autoReconnect: true) se recuperar
-            // sozinho, sem matar a conexão em andamento (evita loop de reconexão infinito)
-            for (let i = 0; i < 10 && !client.connected && !ctrl.signal.aborted; i++) {
-              await new Promise(r => setTimeout(r, 500));
-            }
-            if (!client.connected) {
-              console.warn(`[listen] autoReconnect não recuperou em 5s — forçando reloadClient (${schedule.id})`);
-              client = await reloadClient(account);
-              try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
-            }
+            console.warn(`[listen] Client desconectou — reconectando para ${schedule.id}`);
+            client = await getClient(account);
+            try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
           }
 
           const peer   = await resolvePeer(client, group.telegram_chat_id!, account.id);
-
-          let result: any;
-          try {
-            result = await client.invoke(
-              new Api.messages.GetHistory({
-                peer: peer as any, limit: 10,
-                offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-                hash: bigInt(0), addOffset: 0,
-              })
-            );
-          } catch (err: any) {
-            const errMsg = String(err?.message ?? "");
-            const isFlood =
-              err?.seconds != null ||
-              err?.constructor?.name === "FloodWaitError" ||
-              /flood/i.test(errMsg);
-
-            if (isFlood) {
-              const waitSecs = typeof err.seconds === "number"
-                ? err.seconds
-                : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "30", 10);
-              console.warn(`[listen] FloodWait ${waitSecs}s no GetHistory (${schedule.id}) — pausando o tempo exato`);
-              if (!ctrl.signal.aborted) {
-                await new Promise(r => setTimeout(r, waitSecs * 1000));
-              }
-              continue;
-            }
-
-            throw err;
-          }
+          const result = await client.invoke(
+            new Api.messages.GetHistory({
+              peer: peer as any, limit: 10,
+              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+              hash: bigInt(0), addOffset: 0,
+            })
+          ) as any;
 
           const recentMsgs = (result.messages ?? []).filter(
             (m: any) =>
@@ -1253,7 +1414,13 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
           }
 
-          const gotSignal = recentMsgs.some((m: any) => isSignalMessage(m));
+          // v16: aceita qualquer texto não vazio (inclui emoji) OU qualquer mídia
+          // (figurinha, foto, gif, sticker, etc.)
+          const gotSignal = recentMsgs.some((m: any) => {
+            const hasText = typeof m.message === "string" && m.message.trim().length > 0;
+            const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
+            return hasText || isMedia;
+          });
 
           if (gotSignal && !ctrl.signal.aborted) {
             console.log(`[listen] ✓ Sinal detectado — disparando schedule ${schedule.id}`);
@@ -1320,6 +1487,8 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
 
 /* ─────────────────────────────────────────────────────────────────────────────
    DESPACHO PARA O GRUPO
+   v17 BUG #P: cada slot tem timeout externo de DISPATCH_SLOT_TIMEOUT_MS.
+   Uma conta lenta não bloqueia as outras no Promise.all.
    ───────────────────────────────────────────────────────────────────────────── */
 async function dispatchToGroup(
   schedule: Schedule,
@@ -1349,8 +1518,18 @@ async function dispatchToGroup(
     let retryable = false;
 
     try {
+      // v17 BUG #P: wraps o sendMessage com timeout externo por slot.
+      // Impede que backoff interno (até 8s) de uma conta atrase as demais.
       const client = await getClient(account);
-      await sendMessage(client, account, group.telegram_chat_id!, member.message_text ?? "");
+      await Promise.race([
+        sendMessage(client, account, group.telegram_chat_id!, member.message_text ?? ""),
+        new Promise<never>((_, r) =>
+          setTimeout(
+            () => r(new Error(`DISPATCH_SLOT_TIMEOUT após ${DISPATCH_SLOT_TIMEOUT_MS}ms`)),
+            DISPATCH_SLOT_TIMEOUT_MS
+          )
+        ),
+      ]);
       status = "sent";
       alreadySent.add(account.id);
       console.log(`[dispatch] ✓ ${account.phone_number}`);
@@ -1523,9 +1702,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
         return;
       }
 
-      // Listener deve ser a conta que de fato envia mensagem (message_text preenchido),
-      // não simplesmente a de menor position — contas só de monitoramento (sem
-      // message_text) não devem ficar "ouvindo" o sinal do admin.
+      // Conta listener: a primeira com message_text configurado e ativa
       const listenerAccount = (group.group_members ?? [])
         .filter(m => m.is_active && m.accounts?.is_active && m.message_text)
         .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
@@ -1858,6 +2035,13 @@ async function prewarmAccounts(): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    HTTP SERVER
+   Endpoints disponíveis:
+     GET  /accounts/:id/chats
+     GET  /accounts/:id/chat-count?chat_id=...
+     GET  /accounts/:id/chat-members?chat_id=...
+     POST /accounts/:id/reload
+     DELETE /groups/:id/listen   — aborta listener ativo
+     POST /groups/:id/dispatch   — disparo manual (send_to_self opcional)
    ───────────────────────────────────────────────────────────────────────────── */
 function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -1871,6 +2055,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
+  // GET /accounts/:id/chats
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1894,6 +2079,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // GET /accounts/:id/chat-count
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1959,6 +2145,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // GET /accounts/:id/chat-members
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -2038,6 +2225,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /accounts/:id/reload
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -2067,153 +2255,16 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // DELETE /groups/:id/listen — aborta listener ativo de grupo aberto
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
-  if (listenMatch) {
+  if (listenMatch && req.method === "DELETE") {
     const groupId = listenMatch[1];
-
-    if (req.method === "DELETE") {
-      const ctrl = listenMap.get(groupId);
-      if (ctrl) { ctrl.abort(); listenMap.delete(groupId); }
-      return jsonResponse(res, 200, { ok: true });
-    }
-
-    if (req.method === "POST") {
-      const existing = listenMap.get(groupId);
-      if (existing) existing.abort();
-
-      const ctrl = new AbortController();
-      listenMap.set(groupId, ctrl);
-
-      (async () => {
-        try {
-          const { data: grpRow } = await supabase
-            .from("groups")
-            .select(`
-              id, telegram_chat_id, group_type, trigger_account_id,
-              group_members(id, message_text, position, is_active,
-                accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
-            `)
-            .eq("id", groupId)
-            .single();
-
-          if (!grpRow) { console.warn(`[listen-manual] Grupo ${groupId} não encontrado`); return; }
-
-          const chatId  = String(grpRow.telegram_chat_id);
-          const members: GroupMember[] = (grpRow.group_members ?? []).map((m: any) => ({
-            ...m,
-            accounts: Array.isArray(m.accounts) ? (m.accounts[0] ?? null) : (m.accounts ?? null),
-          }));
-
-          const firstMember = members.find(m => m.is_active && m.accounts?.is_active);
-          if (!firstMember?.accounts) {
-            console.warn(`[listen-manual] Sem conta ativa em ${groupId}`);
-            return;
-          }
-
-          const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
-          const client  = await getClient(account);
-
-          const deadline    = Date.now() + 2 * 60 * 60_000;
-          const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
-          let lastSeenMsgId = 0;
-
-          try { await resolvePeer(client, chatId, account.id); } catch {}
-          console.log(`[listen-manual] 👂 Aguardando OK em ${chatId} (grupo ${groupId})`);
-
-          while (Date.now() < deadline && !ctrl.signal.aborted) {
-            try {
-              const peer   = await resolvePeer(client, chatId, account.id);
-              const result = await client.invoke(
-                new Api.messages.GetHistory({
-                  peer: peer as any, limit: 10,
-                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
-                  hash: bigInt(0), addOffset: 0,
-                })
-              ) as any;
-
-              const recentMsgs = (result.messages ?? []).filter(
-                (m: any) =>
-                  (m.className === "Message" || m._ === "message") &&
-                  m.date >= startUnix &&
-                  m.id > lastSeenMsgId
-              );
-              if (recentMsgs.length > 0) {
-                lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
-              }
-
-              const gotSignal = recentMsgs.some((m: any) => isSignalMessage(m));
-
-              if (gotSignal && !ctrl.signal.aborted) {
-                console.log(`[listen-manual] ✓ Sinal detectado para grupo ${groupId}`);
-                listenMap.delete(groupId);
-                await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
-
-                const { data: grpFull } = await supabase
-                  .from("groups")
-                  .select("name, telegram_chat_name, user_id")
-                  .eq("id", groupId)
-                  .single();
-
-                const scheduleStub = {
-                  id:                         `manual-${groupId}-${Date.now()}`,
-                  user_id:                    grpFull?.user_id ?? "",
-                  group_id:                   groupId,
-                  cron_expression:            "0 0 * * 0",
-                  next_run_at:                new Date().toISOString(),
-                  retry_window_seconds:       60,
-                  retry_interval_seconds:     5,
-                  retry_interval_max_seconds: 30,
-                  retry_count:                0,
-                  retry_until:                null,
-                  last_attempt_at:            null,
-                  groups: {
-                    id:                   groupId,
-                    name:                 grpFull?.name ?? groupId,
-                    telegram_chat_id:     chatId,
-                    telegram_chat_name:   grpFull?.telegram_chat_name ?? null,
-                    group_type:           "open" as const,
-                    trigger_account_id:   null,
-                    group_members:        members,
-                  },
-                };
-
-                const dispatchedAt = new Date();
-                const results      = await dispatchToGroup(scheduleStub as any, scheduleStub.groups, new Set());
-
-                const sentForMonitor = results
-                  .filter(r => r.status === "sent")
-                  .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
-                  .filter(r => r.message_text);
-                if (sentForMonitor.length > 0) {
-                  monitorPositions(chatId, sentForMonitor, scheduleStub.id, dispatchedAt, "open").catch(() => {});
-                }
-
-                const sent = results.filter(r => r.status === "sent").length;
-                console.log(`[listen-manual] ✓ ${sent} mensagem(ns) enviada(s) para grupo ${groupId}`);
-                return;
-              }
-            } catch (err: any) {
-              if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, 2_000));
-            }
-
-            if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, LISTEN_POLL_MS));
-          }
-
-          if (!ctrl.signal.aborted) {
-            await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
-          }
-          listenMap.delete(groupId);
-
-        } catch (err: any) {
-          console.error(`[listen-manual] Erro inesperado para grupo ${groupId}:`, err.message);
-          listenMap.delete(groupId);
-        }
-      })();
-
-      return jsonResponse(res, 200, { ok: true });
-    }
+    const ctrl = listenMap.get(groupId);
+    if (ctrl) { ctrl.abort(); listenMap.delete(groupId); }
+    return jsonResponse(res, 200, { ok: true });
   }
 
+  // POST /groups/:id/dispatch — disparo manual (aquecimento ou envio direto)
   const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
   if (req.method === "POST" && dispatchMatch) {
     const groupId = dispatchMatch[1];
