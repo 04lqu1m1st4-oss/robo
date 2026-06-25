@@ -229,7 +229,7 @@ const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
 // Monitor v12/v15: aguarda N segundos após disparo para capturar histórico completo
-const MONITOR_POST_DISPATCH_WAIT_MS = 10_000;
+const MONITOR_POST_DISPATCH_WAIT_MS = 2_000;
 const MONITOR_HISTORY_FETCH_LIMIT   = 200;
 // Janela de tempo antes do disparo para buscar contexto (fetch mais amplo)
 const MONITOR_WINDOW_BEFORE_MS      = 5_000;
