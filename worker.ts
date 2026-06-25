@@ -222,7 +222,7 @@ const ONE_WAY_RTT_ESTIMATE_MS       = 23;   // RTT one-way medido VPS→Telegram
 // Com ONE_WAY=23 e TARGET=10: precisa de >13ms. 45ms dá margem confortável.
 const SNIPER_BEFORE_MS              = 45;
 const SNIPER_SEND_TIMEOUT_MS        = 800;
-const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
+const SNIPER_ATTEMPT_INTERVAL_MS    = 3;
 const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
