@@ -140,6 +140,19 @@
 //     Log de debug adicionado: mostra total de msgs, na janela, windowStartUnix e
 //     date da primeira msg — facilita calibração futura sem precisar de logs extras.
 //
+// Fix v21 (2025-06) — filtro inWindow usa auctionStartUnix em vez de windowStartUnix-30:
+//
+//   BUG #S — mensagens anteriores ao leilão contaminavam windowMsgs (closed e open):
+//     windowStartUnix - 30 abria uma janela de até 35s antes do leilão.
+//     Mensagens de conversa prévia entravam no filtro, inflavam a contagem de
+//     posições e impediam a resolução do msg_id (msg da conta tinha date=scheduledAt-1s
+//     mas auctionStartUnix=scheduledAt, caindo fora do filtro de resolveMsgIds).
+//
+//   SOLUÇÃO — inWindow usa auctionStartUnix diretamente:
+//     Para closed: auctionStartUnix = Math.floor(dispatchedAt / 1000) — horário exato.
+//     Para open:   auctionStartUnix = windowStartUnix — mantém comportamento anterior.
+//     Elimina as duas falhas em cascata: windowMsgs limpo + msg_id sempre resolvido.
+//
 // Fix v19 (2025-06) — sleep calibrado movido para fora do Promise.allSettled:
 //
 //   BUG #Q — contention entre snipers simultâneos (dois schedules no mesmo horário):
@@ -1271,14 +1284,15 @@ async function monitorPositions(
         })
       ) as any;
 
-      // v20: GramJS retorna className ("Message"), não m._ ("message").
-      // O filtro anterior rejeitava 100% das mensagens causando "Nenhuma mensagem na janela".
-      // Aceita tanto className quanto m._ para compatibilidade com diferentes versões do GramJS.
-      // windowStartUnix expandido para 30s antes para absorver skew de clock VPS/Telegram.
+      // v21: filtra apenas mensagens a partir do horário exato do leilão (auctionStartUnix).
+      // Antes usava windowStartUnix-30 (35s antes do leilão), puxando mensagens de conversa
+      // anterior que inflavam a contagem de posições e impediam a resolução do msg_id.
+      const auctionStartUnix = Math.floor(dispatchedAt.getTime() / 1000);
+
       const windowMsgs: any[] = (result.messages ?? [])
         .filter((m: any) => {
           const isMsg = m.className === "Message" || m._ === "message" || m.message != null;
-          const inWindow = (m.date as number) >= windowStartUnix - 30;
+          const inWindow = (m.date as number) >= auctionStartUnix;
           return isMsg && inWindow;
         })
         .sort((a: any, b: any) => (a.id as number) - (b.id as number));
@@ -1286,7 +1300,7 @@ async function monitorPositions(
       console.log(
         `[monitor][debug] Total msgs no GetHistory: ${result.messages?.length ?? 0}, ` +
         `na janela: ${windowMsgs.length}, ` +
-        `windowStartUnix=${windowStartUnix}, ` +
+        `auctionStartUnix=${auctionStartUnix}, ` +
         `primeira msg date=${result.messages?.[0]?.date ?? "N/A"} ` +
         `(schedule ${scheduleId})`
       );
@@ -1299,8 +1313,6 @@ async function monitorPositions(
       console.log(
         `[monitor] ${windowMsgs.length} msg(s) na janela para schedule ${scheduleId} (closed)`
       );
-
-      const auctionStartUnix = Math.floor(dispatchedAt.getTime() / 1000);
 
       // v17 BUG #N: resolve msg_id por conta antes de salvar posições
       const myMsgIds = resolveMsgIds(sentMembers, windowMsgs, auctionStartUnix);
@@ -1331,11 +1343,12 @@ async function monitorPositions(
         })
       ) as any;
 
-      // v20: mesmo fix do closed — aceita className ou m._ ou presença de m.message
+      // v21: mesmo fix do closed — filtra a partir de auctionStartUnix (= windowStartUnix para open).
+      // Para grupos abertos auctionStartUnix === windowStartUnix, portanto comportamento idêntico ao anterior.
       const windowMsgs: any[] = (result.messages ?? [])
         .filter((m: any) => {
           const isMsg = m.className === "Message" || m._ === "message" || m.message != null;
-          const inWindow = (m.date as number) >= windowStartUnix - 30;
+          const inWindow = (m.date as number) >= auctionStartUnix;
           return isMsg && inWindow;
         })
         .sort((a: any, b: any) => (a.id as number) - (b.id as number));
